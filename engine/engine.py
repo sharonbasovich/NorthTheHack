@@ -1161,9 +1161,9 @@ class Engine:
         spc = getattr(st, "spec_name", 0) & 15
         extc = getattr(self, "_ext_code", 0) & 15
         path = getattr(self, "_choose_path", 0) & 7
+        err = getattr(self, "_batch_err", 0) & 7
         if st.B == 1:
-            V = (dec | (spc << 4) | ((getattr(self, "_batch_err", 0) & 7) << 8)
-                 | (path << 11))
+            V = dec | (spc << 4) | (path << 8) | (err << 11)
         elif st.B == 4:
             V = probes_mask | (extc << 4) | (path << 8)
         elif st.B == 16:
@@ -1317,7 +1317,7 @@ class Engine:
         if v and st.diag_i == 0:
             # one transient V*8MB spike — sets this workload's peak memory
             # to a value we can decode exactly
-            buf = torch.empty(v * 8 * 1024 * 1024, dtype=torch.uint8,
+            buf = torch.empty(v * 2 * 1024 * 1024, dtype=torch.uint8,
                               device=self.dev)
             buf.fill_(0)
             del buf
