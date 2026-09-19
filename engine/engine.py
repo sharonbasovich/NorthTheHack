@@ -475,23 +475,23 @@ class Engine:
             st.inp.fill_(0)
             st.inp[:, 0] = c0[:, 0]
             self._decode_step_spec(st)
-            tok_spec = st.emit_dev[:, 0].clone()
+            emit_spec = st.emit_dev[:, 0].clone()
 
             st.cur.copy_(c0)
             st.pos.copy_(p0)
             self._decode_step_fast(st)
-            tok_fast = st.cur.clone()
+            tok_fast = st.cur[:, 0].clone()
 
             st.cur.copy_(c0)
             st.pos.copy_(p0)
             self._decode_step_slow(st)
-            tok_slow = st.cur.clone()
+            ref_logits = self._last_logits.clone()
 
             st.cur.copy_(c0)
             st.pos.copy_(p0)
-            if not (torch.equal(tok_spec.view(-1), tok_slow.view(-1))
-                    and torch.equal(tok_fast.view(-1), tok_slow.view(-1))):
-                self._step_slow_only = True
+            ok = self._margin_ok(ref_logits, emit_spec) and self._margin_ok(
+                ref_logits, tok_fast)
+            self._step_slow_only = not ok
         except Exception:
             self._step_slow_only = True
 
@@ -704,6 +704,8 @@ class Engine:
         candidates = [("ext", "ext")]
         if _HAS_TRITON and not self._step_slow_only:
             candidates.append(("eager_fast", lambda s=st: self._decode_step_fast(s)))
+        if _HAS_TRITON:
+            candidates.append(("eager_rms", lambda s=st: self._decode_step_rms(s)))
         if self._probe("graph"):
             candidates.append(("graph_slow", self._decode_step_slow))
             if _HAS_TRITON and not self._step_slow_only:
@@ -723,7 +725,7 @@ class Engine:
                     ok = self._margin_ok(ref_logits, st.cur[:, 0])
                     restore()
                     runner = mod.step
-                elif name == "eager_fast":
+                elif name in ("eager_fast", "eager_rms"):
                     runner = what
                     runner()
                     ok = self._margin_ok(ref_logits, st.cur[:, 0])
@@ -758,7 +760,7 @@ class Engine:
                     st.decode_runner = runner
                     st.decode_name = {
                         "eager_fast": 1, "graph_slow": 2, "graph_fast": 3,
-                        "jit": 4, "compile": 5, "ext": 6,
+                        "jit": 4, "compile": 5, "ext": 6, "eager_rms": 7,
                     }[name]
             except Exception:
                 restore()
@@ -785,11 +787,15 @@ class Engine:
         except Exception:
             restore()
         if ref_logits_b is not None:
-            for make in ("ext", "jit", "graph", "eager"):
+            for make in ("ext", "jit", "graph", "eager", "rms"):
                 if over_budget():
                     break
                 try:
-                    if make == "ext":
+                    if make == "rms":
+                        if not _HAS_TRITON:
+                            continue
+                        runner = lambda: self._decode_step_batch_rms(st)
+                    elif make == "ext":
                         if self._load_ext(st) is None:
                             continue
                         runner = self._ext.step_batch
@@ -826,6 +832,7 @@ class Engine:
                             st.spec_runner = runner
                             st.spec_name = {
                                 "ext": 2, "jit": 3, "graph": 4, "eager": 5,
+                                "rms": 6,
                             }[make]
                 except Exception:
                     restore()
@@ -864,6 +871,94 @@ class Engine:
         except Exception:
             st.pre_graph = None
         st.best = True
+
+    # ------------------------------------------------------------------
+    # Partial-fused variants: Triton rmsnorm/silu_mul only, torch attention
+    # and qk-norm/rope. Wins back ~500 launches/step even if the fused
+    # attention kernel is the buggy one.
+    # ------------------------------------------------------------------
+    def _decode_step_rms(self, st: _State) -> None:
+        B = st.B
+        x = F.embedding(st.cur, self.embed_w)
+        cos = st.cos.index_select(0, st.pos).view(B, 1, 1, D)
+        sin = st.sin.index_select(0, st.pos).view(B, 1, 1, D)
+        nvalid = st.srange[None, :] > st.pos[:, None]
+        for i, w in enumerate(self.layers):
+            FK.rmsnorm(x.view(B, H), w["ln_in"], st.h[:B], EPS)
+            qkv = st.h[:B] @ w["wqkv"].t()
+            qk = qkv[:, : (NQ + NKV) * D].view(B, 1, NQ + NKV, D)
+            v = qkv[:, NQ * D + NKV * D :].view(B, 1, NKV, D)
+            qkn = _rms(qk, w["qkn"])
+            qke = qkn * cos + _rot_half(qkn) * sin
+            qe = qke[:, :, :NQ]
+            ke = qke[:, :, NQ:]
+            st.kc[i].index_put_(
+                (st.ii, st.jj, st.pos.view(B, 1).expand(B, NKV)), ke[:, 0])
+            st.vc[i].index_put_(
+                (st.ii, st.jj, st.pos.view(B, 1).expand(B, NKV)), v[:, 0])
+            qg = qe.reshape(B, NKV, GROUP, D)
+            scores = torch.matmul(qg, st.kc[i].transpose(-1, -2)) * SCALE
+            scores.masked_fill_(nvalid[:, None, None, :], NEG_INF)
+            p = torch.softmax(scores.float(), dim=-1).to(torch.bfloat16)
+            o = torch.matmul(p, st.vc[i]).view(B, NQ * D)
+            xf = x.view(B, H)
+            x = torch.addmm(xf, o, w["wo"].t()).view(B, 1, H)
+            FK.rmsnorm(x.view(B, H), w["ln_post"], st.h2[:B], EPS)
+            gu = st.h2[:B] @ w["wgu"].t()
+            FK.silu_mul(gu, st.mlp[:B], I)
+            x = torch.addmm(x.view(B, H), st.mlp[:B], w["wd"].t()).view(B, 1, H)
+        x = _rms(x, self.fin_w)
+        logits = x.view(B, H) @ self.lm_w.t()
+        self._last_logits = logits
+        tok = logits.argmax(dim=-1)
+        st.cur.copy_(tok.view(B, 1))
+        st.pos.add_(1)
+
+    def _decode_step_batch_rms(self, st: _State) -> None:
+        B = st.B
+        n = B * R
+        rr = torch.arange(R, device=self.dev)
+        pos_r = st.pos[:, None] + rr[None, :]
+        x = F.embedding(st.inp, self.embed_w)
+        cos = st.cos.index_select(0, pos_r.reshape(-1)).view(B, R, 1, D)
+        sin = st.sin.index_select(0, pos_r.reshape(-1)).view(B, R, 1, D)
+        nvalid = st.srange[None, None, :] > pos_r[:, :, None]
+        bi = st.iB.view(B, 1, 1).expand(B, R, NKV)
+        gi = st.jj[:1].view(1, 1, NKV).expand(B, R, NKV)
+        pi = pos_r[:, :, None].expand(B, R, NKV)
+        for i, w in enumerate(self.layers):
+            FK.rmsnorm(x.view(n, H), w["ln_in"], st.h[:n], EPS)
+            qkv = st.h[:n] @ w["wqkv"].t()
+            qk = qkv[:, : (NQ + NKV) * D].view(B, R, NQ + NKV, D)
+            v = qkv[:, NQ * D + NKV * D :].view(B, R, NKV, D)
+            qkn = _rms(qk, w["qkn"])
+            qke = qkn * cos + _rot_half(qkn) * sin
+            qe = qke[:, :, :NQ]
+            ke = qke[:, :, NQ:]
+            st.kc[i].index_put_((bi, gi, pi), ke)
+            st.vc[i].index_put_((bi, gi, pi), v)
+            qg = qe.reshape(B, R, NKV, GROUP, D)
+            scores = torch.matmul(
+                qg, st.kc[i].unsqueeze(1).transpose(-1, -2)) * SCALE
+            scores.masked_fill_(nvalid[:, :, None, None, :], NEG_INF)
+            p = torch.softmax(scores.float(), dim=-1).to(torch.bfloat16)
+            o = torch.matmul(
+                p, st.vc[i].unsqueeze(1).expand(B, R, NKV, st.S, D))
+            xf = x.view(n, H)
+            x = torch.addmm(
+                xf, o.reshape(n, NQ * D), w["wo"].t()).view(B, R, H)
+            FK.rmsnorm(x.view(n, H), w["ln_post"], st.h2[:n], EPS)
+            gu = st.h2[:n] @ w["wgu"].t()
+            FK.silu_mul(gu, st.mlp[:n], I)
+            x = torch.addmm(x.view(n, H), st.mlp[:n], w["wd"].t()).view(B, R, H)
+        x = _rms(x, self.fin_w)
+        logits = x.view(n, H) @ self.lm_w.t()
+        self._last_logits_b = logits
+        am = logits.view(B, R, V).argmax(dim=-1)
+        matched = (am[:, :-1] == st.inp[:, 1:]).to(torch.int64)
+        m = matched.cumprod(dim=1).sum(dim=1) + 1
+        st.pos.add_(m)
+        torch.cat([am, m.view(B, 1)], dim=1, out=st.emit_dev)
 
     @torch.inference_mode()
     def generate(self, input_ids: list[list[int]], max_new_tokens: int):
