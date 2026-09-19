@@ -833,13 +833,13 @@ class Engine:
         st.spec_window = []
         st.spec_cooldown = 0
         # telemetry: one bit per measured sample — sample k of a workload
-        # carries bit k as a fixed 20ms ttft delta. bits: [0-2] decode
-        # runner, [3-5] spec runner, [6] ext built, [7] slow-only.
-        bits = getattr(st, "decode_name", 0) | (getattr(st, "spec_name", 0) << 3)
-        bits |= (1 if self._ext is not None else 0) << 6
-        bits |= (1 if self._step_slow_only else 0) << 7
+        # carries bit k as a fixed 20ms ttft delta. warmup call carries none.
+        # bits: [0-2] decode runner, [3] ext built, [4] spec enabled.
+        bits = getattr(st, "decode_name", 0)
+        bits |= (1 if self._ext is not None else 0) << 3
+        bits |= (1 if st.spec_enabled else 0) << 4
         st.diag = bits
-        st.diag_i = 0
+        st.diag_i = -1   # -1 marks the warmup generation
 
         # whole-prefill graph: replays identical work per call, verified
         # against the eager prefill's argmax before use.
@@ -892,11 +892,10 @@ class Engine:
         for b in range(B):
             hists[b].append(queues[b][0])
 
-        if getattr(st, "diag", 0):
-            b = st.diag_i % 8
-            st.diag_i += 1
-            if (st.diag >> b) & 1:
-                time.sleep(0.02)  # telemetry bit b -> +20ms ttft
+        if getattr(st, "diag", 0) and st.diag_i >= 0:
+            if (st.diag >> st.diag_i) & 1:
+                time.sleep(0.02)  # telemetry bit -> +20ms ttft on this sample
+        st.diag_i = getattr(st, "diag_i", 0) + 1
         i = 0
         while i < max_new_tokens:
             while min(len(q) for q in queues) <= i:
