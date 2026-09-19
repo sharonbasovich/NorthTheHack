@@ -520,6 +520,31 @@ class Engine:
         except Exception:
             return float("inf")
 
+    def _watchdog(self, secs: int):
+        """SIGALRM-based hard timeout for unbounded calls (jit trace, ext
+        compile). Returns a disarm function; no-op outside the main thread."""
+        try:
+            import signal
+            def _raise(sig, frame):
+                raise TimeoutError("watchdog %ds" % secs)
+            old = signal.signal(signal.SIGALRM, _raise)
+            signal.alarm(secs)
+            def disarm():
+                try:
+                    signal.alarm(0)
+                    signal.signal(signal.SIGALRM, old)
+                except Exception:
+                    pass
+            return disarm
+        except Exception:
+            return lambda: None
+
+    def _dbg(self, msg: str) -> None:
+        try:
+            print("KR " + msg, flush=True)
+        except Exception:
+            pass
+
     def _probe(self, kind: str) -> bool:
         """Cheap capability probes — a graph capture or compile of a trivial
         op fails on some runtimes (gVisor); skip the expensive variant then."""
@@ -599,14 +624,29 @@ class Engine:
             # cold build while well inside the 300s load+warmup budget, and
             # only from the first process that tries.
             if not warm:
-                if time.time() - self._t0 > 90:
+                if time.time() - self._t0 > 60:
                     return None
                 open(busy_f, "w").write("1")
             src = os.path.join(os.path.dirname(__file__),
                                "kernels", "decode_ext.cpp")
+            old_sig = None
+            try:
+                import signal
+                def _to(sig, frame):
+                    raise TimeoutError("ext compile watchdog")
+                old_sig = signal.signal(signal.SIGALRM, _to)
+                signal.alarm(0 if warm else 150)
+            except Exception:
+                old_sig = None
             try:
                 mod = load(name="kr_decode_ext", sources=[src], verbose=False)
             finally:
+                if old_sig is not None:
+                    try:
+                        signal.alarm(0)
+                        signal.signal(signal.SIGALRM, old_sig)
+                    except Exception:
+                        pass
                 try:
                     os.remove(busy_f)
                 except Exception:
@@ -740,8 +780,12 @@ class Engine:
                     restore()
                     runner = g.replay
                 elif name == "jit":
-                    traced = torch.jit.trace(
-                        lambda: self._decode_step_slow(st), ())
+                    disarm = self._watchdog(30)
+                    try:
+                        traced = torch.jit.trace(
+                            lambda: self._decode_step_slow(st), ())
+                    finally:
+                        disarm()
                     traced()
                     ok = self._margin_ok(ref_logits, st.cur[:, 0])
                     restore()
@@ -766,7 +810,10 @@ class Engine:
                     }[name]
                     if name == "jit":
                         self._jit_ok = True
-            except Exception:
+                else:
+                    self._dbg("cand %s margin_fail" % name)
+            except Exception as e:
+                self._dbg("cand %s err %s" % (name, repr(e)[:160]))
                 restore()
 
         # spec-verify pass: pure-torch batch verify is provably correct;
@@ -808,8 +855,12 @@ class Engine:
                         # tracing is ~1400 ops and not worth it otherwise
                         if not getattr(self, "_jit_ok", False):
                             continue
-                        runner = torch.jit.trace(
-                            lambda: self._decode_step_slow_batch(st), ())
+                        disarm = self._watchdog(30)
+                        try:
+                            runner = torch.jit.trace(
+                                lambda: self._decode_step_slow_batch(st), ())
+                        finally:
+                            disarm()
                     elif make == "graph" and (
                         _HAS_TRITON and not self._step_slow_only
                         and self._probe("graph")
@@ -840,10 +891,26 @@ class Engine:
                                 "ext": 2, "jit": 3, "graph": 4, "eager": 5,
                                 "rms": 6,
                             }[make]
-                except Exception:
+                        else:
+                            self._dbg("spec %s margin_fail" % make)
+                except Exception as e:
+                    self._dbg("spec %s err %s" % (make, repr(e)[:160]))
                     restore()
         st.spec_enabled = st.spec_runner is not None
         st.spec_window = []
+        try:
+            print(
+                "KR_DIAG decode=%d(%.1fms) ext=%s spec=%d(%.1fms) "
+                "probes=%s slow_only=%s choose_s=%.1f" % (
+                    st.decode_name, st.decode_ms,
+                    "built" if self._ext is not None else "none",
+                    st.spec_name, st.spec_ms,
+                    sorted(k for k, v in self._probes.items() if v),
+                    bool(self._step_slow_only),
+                    time.time() - choose_t0),
+                flush=True)
+        except Exception:
+            pass
         st.spec_cooldown = 0
         # telemetry: one bit per measured sample — sample k of a workload
         # carries bit k as a fixed 20ms ttft delta. warmup call carries none.
