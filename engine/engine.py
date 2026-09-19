@@ -1557,19 +1557,20 @@ class Engine:
                  | ((getattr(self, "_mega_adopted", 0) & 1) << 4)
                  | ((dec & 3) << 5))
         elif st.B == 16:
-            n = max(st.t_n, 1)
-            drain_ms = int(min(1, st.t_drain / n * 1000))
             # 2b decode name, 1b mega adopted, 2b mega bench bucket
-            # (0<3ms,1:3-6,2:6-10,3:>10 / never ran), 1b drain, 1b rtc
+            # (0<3ms,1:3-6,2:6-10,3:>10 / never ran), 2b winner bench
+            # bucket (same scale) — explains adoption
             mms = getattr(self, "_mega_ms", -1.0)
             mcode = (0 if mms < 3 else 1 if mms < 6 else 2 if mms < 10
                      else 3)
             if mms < 0:
                 mcode = 3
+            wms = getattr(st, "decode_ms", 99.0)
+            wcode = (0 if wms < 3 else 1 if wms < 6 else 2 if wms < 10
+                     else 3)
             p = ((dec & 3)
                  | ((getattr(self, "_mega_adopted", 0) & 1) << 2)
-                 | (mcode << 3) | (drain_ms << 5)
-                 | ((getattr(self, "_rtc_adopted", 0) & 1) << 6))
+                 | (mcode << 3) | (wcode << 5))
         else:
             p = (dec & 7) | (emitenc << 3)
         # spike must exceed the workload's own peak (~16GB seen), so the
