@@ -20,6 +20,7 @@ bf16 rope tables identical to the model's own rotary module, fp32 softmax,
 lowest-index argmax.
 """
 
+import os
 import time
 
 import torch
@@ -244,6 +245,9 @@ class Engine:
             )
         self.states = {}
         self._probes = {}
+        self._ext = None       # compiled C++ decode-step module
+        self._ext_tried = False
+        self._t0 = time.time()   # engine creation; guards warmup budget
 
     # ------------------------------------------------------------------
     # Verify pass: R rows per sequence. Emits 1..R tokens/row into emit_dev.
@@ -549,6 +553,44 @@ class Engine:
         self._probes[kind] = ok
         return ok
 
+    def _load_ext(self, st: _State):
+        """Compile the C++ decode-step module once per process. Plain at::
+        calls from C++ skip Python dispatch; ~1-3us/op vs ~10-15us. Needs a
+        C++ toolchain and a writable TORCH_EXTENSIONS_DIR — returns None
+        otherwise. Compiled artifact is cached across processes by torch."""
+        if self._ext_tried:
+            return self._ext
+        self._ext_tried = True
+        try:
+            import shutil
+            if not ((shutil.which("c++") or shutil.which("g++")
+                     or shutil.which("cc")) and shutil.which("ninja")):
+                return None
+            from torch.utils.cpp_extension import (
+                load, _get_build_directory)
+            bdir = _get_build_directory("kr_decode_ext", verbose=False)
+            warm = os.path.exists(os.path.join(bdir, "kr_decode_ext.so"))
+            # a cold compile is ~60-120s; a warm load is ~1-2s. Only burn a
+            # cold build while well inside the 300s load+warmup budget.
+            if not warm and time.time() - self._t0 > 180:
+                return None
+            src = os.path.join(os.path.dirname(__file__),
+                               "kernels", "decode_ext.cpp")
+            mod = load(name="kr_decode_ext", sources=[src], verbose=False)
+            weights = [self.embed_w, self.lm_w, self.fin_w]
+            for w in self.layers:
+                weights += [w["ln_in"], w["wqkv"], w["wo"],
+                            w["ln_post"], w["wgu"], w["wd"], w["qkn"]]
+            state = [st.cur, st.pos, st.cos, st.sin, st.srange,
+                     st.inp, st.emit_dev,
+                     st.iB, torch.arange(NKV, device=self.dev)]
+            mod.init(weights, st.kc, st.vc, state,
+                     st.B, NL, NQ, NKV, D, H, I, V, R, st.S, EPS, SCALE)
+            self._ext = mod
+            return mod
+        except Exception:
+            return None
+
     def _spec_pass(self, st: _State, queues, hists) -> int:
         """One verify pass: build draft inputs, run graph, append emitted
         tokens to per-row queues and n-gram histories. Returns mean emit count."""
@@ -621,10 +663,19 @@ class Engine:
             candidates.append(("jit", "jit"))
         if self._probe("compile"):
             candidates.append(("compile", "compile"))
+        candidates.append(("ext", "ext"))
 
         for name, what in candidates:
             try:
-                if name == "eager_fast":
+                if name == "ext":
+                    mod = self._load_ext(st)
+                    if mod is None:
+                        continue
+                    mod.step()
+                    ok = self._margin_ok(ref_logits, st.cur[:, 0])
+                    restore()
+                    runner = mod.step
+                elif name == "eager_fast":
                     runner = what
                     runner()
                     ok = self._margin_ok(ref_logits, st.cur[:, 0])
@@ -681,9 +732,13 @@ class Engine:
         except Exception:
             restore()
         if ref_logits_b is not None:
-            for make in ("jit", "graph", "eager"):
+            for make in ("ext", "jit", "graph", "eager"):
                 try:
-                    if make == "jit":
+                    if make == "ext":
+                        if self._load_ext(st) is None:
+                            continue
+                        runner = self._ext.step_batch
+                    elif make == "jit":
                         if not self._probe("jit"):
                             continue
                         runner = torch.jit.trace(
