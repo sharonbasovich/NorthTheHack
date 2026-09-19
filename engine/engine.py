@@ -408,6 +408,45 @@ class Engine:
         st.cur.copy_(tok.view(B, 1))
         st.pos.add_(1)
 
+    def _decode_step_sdpa(self, st: _State) -> None:
+        """Plain-torch step with fused ops: F.rms_norm + SDPA (enable_gqa)
+        instead of the manual matmul/mask/softmax chain — roughly half the
+        CUDA calls per layer. Numerics differ from _decode_step_slow, so
+        adoption is margin-gated like every other candidate."""
+        B = st.B
+        rms_norm = getattr(F, "rms_norm")
+        x = F.embedding(st.cur, self.embed_w)
+        cos = st.cos.index_select(0, st.pos).view(B, 1, 1, D)
+        sin = st.sin.index_select(0, st.pos).view(B, 1, 1, D)
+        amask = (st.srange[None, :] <= st.pos[:, None]).view(B, 1, 1, st.S)
+        for i, w in enumerate(self.layers):
+            h = rms_norm(x.view(B, H), (H,), w["ln_in"], EPS)
+            qkv = h @ w["wqkv"].t()
+            qk = qkv[:, : (NQ + NKV) * D].view(B, 1, NQ + NKV, D)
+            v = qkv[:, NQ * D + NKV * D :].view(B, 1, NKV, D)
+            qkn = rms_norm(qk, (D,), w["qkn"], EPS)
+            qke = qkn * cos + _rot_half(qkn) * sin
+            qe = qke[:, :, :NQ]
+            ke = qke[:, :, NQ:]
+            _fl = st.kw1 + st.pos.view(B, 1).expand(B, NKV).reshape(-1)
+            st.kc[i].view(-1, D).index_copy_(0, _fl, ke.reshape(-1, D))
+            st.vc[i].view(-1, D).index_copy_(0, _fl, v.reshape(-1, D))
+            o = F.scaled_dot_product_attention(
+                qe.transpose(1, 2), st.kc[i], st.vc[i],
+                attn_mask=amask, scale=SCALE, enable_gqa=True)
+            o = o.transpose(1, 2).reshape(B, NQ * D)
+            x = torch.addmm(x.view(B, H), o, w["wo"].t()).view(B, 1, H)
+            h2 = rms_norm(x.view(B, H), (H,), w["ln_post"], EPS)
+            gu = h2 @ w["wgu"].t()
+            m = F.silu(gu[:, :I]) * gu[:, I:]
+            x = torch.addmm(x.view(B, H), m, w["wd"].t()).view(B, 1, H)
+        x = _rms(x, self.fin_w)
+        logits = x.view(B, H) @ self.lm_w.t()
+        self._last_logits = logits
+        tok = logits.argmax(dim=-1)
+        st.cur.copy_(tok.view(B, 1))
+        st.pos.add_(1)
+
     # ------------------------------------------------------------------
     # Plain-torch single-token fallback (same math, more kernels).
     # ------------------------------------------------------------------
@@ -973,10 +1012,13 @@ class Engine:
         self._choose_path = 4
 
         candidates = []
-        if self._probe("graph"):
-            candidates.append(("graph_slow", self._decode_step_slow))
-            if _HAS_TRITON and not self._step_slow_only:
-                candidates.append(("graph_fast", self._decode_step_fast))
+        # try the graph capture even when the probe failed — probes have
+        # been flaky under gVisor and a real capture attempt fails fast.
+        candidates.append(("graph_slow", self._decode_step_slow))
+        if _HAS_TRITON and not self._step_slow_only:
+            candidates.append(("graph_fast", self._decode_step_fast))
+        candidates.append(("eager_sdpa",
+                           lambda s=st: self._decode_step_sdpa(s)))
         if self._probe("toolchain"):
             candidates.append(("ext", "ext"))
         if _HAS_TRITON and not self._step_slow_only:
@@ -1006,7 +1048,7 @@ class Engine:
                     ok = self._margin_ok(ref_logits, st.cur[:, 0], 1.9)
                     restore()
                     runner = mod.step
-                elif name in ("eager_fast", "eager_rms"):
+                elif name in ("eager_fast", "eager_rms", "eager_sdpa"):
                     runner = what
                     runner()
                     ok = self._margin_ok(ref_logits, st.cur[:, 0], 1.9)
@@ -1021,9 +1063,18 @@ class Engine:
                         runner = g.replay
                         if name == "graph_slow":
                             self._gerr = 2 if not ok else 0
-                    except Exception:
+                    except Exception as exc:
                         if name == "graph_slow":
                             self._gerr = 3
+                            en = type(exc).__name__
+                            msg = str(exc)
+                            self._gexc = (
+                                1 if "Assertion" in en
+                                else 2 if "Runtime" in en
+                                else 3 if "graph" in msg.lower()
+                                else 4 if "capture" in msg.lower()
+                                else 5 if "out of memory" in msg.lower()
+                                else 6)
                         raise
                 elif name == "jit":
                     disarm = self._watchdog(30)
@@ -1052,6 +1103,7 @@ class Engine:
                     st.decode_name = {
                         "eager_fast": 1, "graph_slow": 2, "graph_fast": 3,
                         "jit": 4, "compile": 5, "ext": 6, "eager_rms": 7,
+                        "eager_sdpa": 5,
                     }[name]
                     if name == "graph_slow":
                         self._gerr = 1
@@ -1073,6 +1125,9 @@ class Engine:
         ref_logits_b = None
         self._batch_err = 15   # 15 = threw inside the step call itself
         try:
+            if True:
+                st.spec_name = 9
+                raise _SkipSpec()
             if st.B * R > 48:
                 # verify pass scales with B*R rows — past ~48 rows it is
                 # compute-bound and loses to plain decode (v25: B=16 ran
@@ -1301,10 +1356,11 @@ class Engine:
         else:
             emitenc = 7
         if st.B == 1:
-            Vd = dec | (emitenc << 4) | (path << 7) | (((err or _opcost)) << 10)
+            Vd = (dec | (emitenc << 4) | ((getattr(self, "_gexc", 0)) << 7)
+                  | (((err or _opcost)) << 10))
         elif st.B == 4:
             Vd = (probes_mask | (dec << 4) | (emitenc << 8)
-                  | ((getattr(self, "_cand_tried", 0) & 7) << 11))
+                  | ((getattr(self, "_gerr", 0) & 7) << 11))
         elif st.B == 16:
             # in-loop split: runner-enqueue ms vs drain-wait ms (0.5ms units)
             n = max(st.t_n, 1)
