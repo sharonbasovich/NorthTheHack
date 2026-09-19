@@ -360,7 +360,7 @@ MEGA_SRC = BF16_HELPERS + r"""
 extern "C" __device__ unsigned cudaCGGetIntrinsicHandle(unsigned long long*);
 extern "C" __device__ void cudaCGSynchronizeGrid(unsigned long long);
 #endif
-#define NT 512
+#define NT 1024
 #define HDIM 2560
 #define VDIM 151936
 #define IDIM 9728
@@ -1162,7 +1162,7 @@ class RtcKernels:
         smem = (cap + 8) * 6 + 512
         if self.megacoop is not None:
             try:
-                self.rtc.launch(self.megacoop, self.nblk, 512, smem,
+                self.rtc.launch(self.megacoop, self.nblk, 1024, smem,
                                 [ptr(lw), ptr(embed), ptr(finw), ptr(cost),
                                  ptr(sint), ptr(pos), ptr(cur), ptr(hid),
                                  ptr(hbuf), ptr(qkv), ptr(obuf), ptr(gu),
@@ -1177,7 +1177,7 @@ class RtcKernels:
             except Exception:
                 self.coop_ok = False
                 self.megacoop = None
-        self.rtc.launch(self.megafn, self.nblk, 512, smem,
+        self.rtc.launch(self.megafn, self.nblk, 1024, smem,
                         [ptr(lw), ptr(embed), ptr(finw), ptr(cost),
                          ptr(sint), ptr(pos), ptr(cur), ptr(hid),
                          ptr(hbuf), ptr(qkv), ptr(obuf), ptr(gu),
