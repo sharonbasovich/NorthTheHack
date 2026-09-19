@@ -149,6 +149,7 @@ class Engine:
         self.embed_w = base.embed_tokens.weight
         self.lm_w = self.model.lm_head.weight
         self.fin_w = base.norm.weight
+        self._step_slow_only = False
         self.layers = []
         for layer in base.layers:
             a = layer.self_attn
@@ -281,6 +282,44 @@ class Engine:
             return self._decode_step_fast
         return self._decode_step_slow
 
+    def _self_check(self, st: _State) -> None:
+        """Cross-validate the fused step against the torch step on live state.
+
+        Runs the fast step once, rewinds pos/cur, runs the slow step, and
+        compares the emitted token. Any exception or disagreement disables the
+        fused path for the rest of the process. Cheap: two extra decode steps,
+        only once per (batch, capacity) state.
+        """
+        if self._step_slow_only or not _HAS_TRITON:
+            return
+        try:
+            c0 = st.cur.clone()
+            p0 = st.pos.clone()
+            self._decode_step_fast(st)
+            tok_fast = st.cur.clone()
+            st.cur.copy_(c0)
+            st.pos.copy_(p0)
+            self._decode_step_slow(st)
+            tok_slow = st.cur.clone()
+            st.cur.copy_(c0)
+            st.pos.copy_(p0)
+            if not torch.equal(tok_fast, tok_slow):
+                self._step_slow_only = True
+        except Exception:
+            self._step_slow_only = True
+
+    def _capture(self, st: _State, step, iters: int) -> None:
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(iters):
+                step(st)
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            step(st)
+        st.graph = g
+
     @torch.inference_mode()
     def generate(self, input_ids: list[list[int]], max_new_tokens: int):
         ids = torch.tensor(input_ids, dtype=torch.int64, device=self.dev)
@@ -290,44 +329,32 @@ class Engine:
         self._reset_decode(st, L, first)
 
         if st.graph is None:
-            step = self._pick_step()
+            self._self_check(st)
+            self._reset_decode(st, L, first)
+            # warmup+capture need `iters+1` spare cache slots past pos=L.
+            spare = max_new_tokens - 2
+            iters = max(0, min(2, spare - 1))
             try:
-                s = torch.cuda.Stream()
-                s.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(s):
-                    for _ in range(3):
-                        step(st)
-                torch.cuda.current_stream().wait_stream(s)
-                self._reset_decode(st, L, first)
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g):
-                    step(st)
-                st.graph = g
-                self._reset_decode(st, L, first)
+                if spare >= 1:
+                    self._capture(st, self._pick_step(), iters)
+                else:
+                    st.graph = False
             except Exception:
-                if step is self._decode_step_fast:
-                    # Triton path failed: retry with the plain-torch step.
-                    self._reset_decode(st, L, first)
+                if not self._step_slow_only:
                     self._step_slow_only = True
+                    self._reset_decode(st, L, first)
                     try:
-                        s = torch.cuda.Stream()
-                        s.wait_stream(torch.cuda.current_stream())
-                        with torch.cuda.stream(s):
-                            for _ in range(3):
-                                self._decode_step_slow(st)
-                        torch.cuda.current_stream().wait_stream(s)
-                        self._reset_decode(st, L, first)
-                        g = torch.cuda.CUDAGraph()
-                        with torch.cuda.graph(g):
-                            self._decode_step_slow(st)
-                        st.graph = g
+                        if spare >= 1:
+                            self._capture(st, self._decode_step_slow, iters)
+                        else:
+                            st.graph = False
                     except Exception:
                         st.graph = False
                 else:
                     st.graph = False
-                self._reset_decode(st, L, first)
+            self._reset_decode(st, L, first)
 
-        use_fast = _HAS_TRITON and not getattr(self, "_step_slow_only", False)
+        use_fast = not self._step_slow_only and _HAS_TRITON
         yield first.tolist()
         for _ in range(max_new_tokens - 1):
             if st.graph:
