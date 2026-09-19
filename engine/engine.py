@@ -1179,7 +1179,8 @@ class Engine:
             self._cand_tried |= 1 << {
                 "graph_slow": 0, "graph_fast": 1, "ext": 2,
                 "eager_fast": 3, "eager_rms": 4, "jit": 5,
-                "compile": 6}.get(name, 6)
+                "compile": 6, "mega_all": 7, "eager_rtc": 8,
+                "eager_rtc2": 9, "eager_sdpa": 10}.get(name, 11)
             try:
                 if name == "ext":
                     mod = self._load_ext(st)
@@ -1254,7 +1255,8 @@ class Engine:
                 self._cand_mask |= 1 << {
                     "graph_slow": 0, "graph_fast": 1, "ext": 2,
                     "eager_fast": 3, "eager_rms": 4, "jit": 5,
-                    "compile": 6}.get(name, 6)
+                    "compile": 6, "mega_all": 7, "eager_rtc": 8,
+                    "eager_rtc2": 9, "eager_sdpa": 10}.get(name, 11)
                 ms = self._bench(runner)
                 restore()
                 if name == "graph_slow" and not (ms < st.decode_ms):
@@ -1537,12 +1539,16 @@ class Engine:
         # payload duplicated into both 7-bit halves of Vd so the decode
         # side can validate against allocator drift: Vd = 512 + p*129
         if st.B == 1:
-            p = ((getattr(self, "_rtc_status", 0) & 7)
-                 | ((getattr(self, "_rtc_adopted", 0) & 1) << 3)
-                 | ((dec & 7) << 4))
+            # which candidates were tried (low 4 bits of tried mask) and
+            # which passed margin (low 3 bits of pass mask)
+            p = ((getattr(self, "_cand_tried", 0) & 15)
+                 | ((getattr(self, "_cand_mask", 0) & 7) << 4))
         elif st.B == 4:
-            p = ((getattr(self, "_gerr", 0) & 7)
-                 | ((getattr(self, "_gmode", 0) & 3) << 3)
+            # bits: 0-2 rtc_status, 3 mega_flag ok, 4 mega adopted,
+            # 5-6 decode name low bits
+            p = ((getattr(self, "_rtc_status", 0) & 7)
+                 | ((getattr(st, "mega_flag", False) & 1) << 3)
+                 | ((getattr(self, "_mega_adopted", 0) & 1) << 4)
                  | ((dec & 3) << 5))
         elif st.B == 16:
             n = max(st.t_n, 1)
