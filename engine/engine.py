@@ -513,11 +513,11 @@ class Engine:
         st.cur.copy_(tok.view(B, 1))
         st.pos.add_(1)
 
-    def _decode_all(self, st: _State) -> None:
-        """One launch per decode step: the whole 36-layer step + final rms +
-        lm head + argmax runs inside a single persistent kernel with software
-        grid barriers. Emits tokens to host-mapped memory (zero per-token
-        CUDA calls besides the launch)."""
+    def _decode_all(self, st: _State, ntok: int = 1) -> None:
+        """Launch the persistent megakernel for `ntok` decode steps. The whole
+        36-layer step + final rms + lm head + argmax run inside ONE kernel
+        with software grid barriers; tokens are written to host-mapped
+        memory so the host polls a flag instead of issuing CUDA calls."""
         rk = self._rtk
         if getattr(st, "m_lw", None) is None:
             B, dev = st.B, self.dev
@@ -546,17 +546,15 @@ class Engine:
                                      device=dev)
             st.m_cnt = torch.zeros(1, dtype=torch.int32, device=dev)
             st.m_gen = torch.zeros(1, dtype=torch.int32, device=dev)
-            # host-mapped flag + token slots (tokcap slots of B tokens)
+            # host-mapped flag + up to tokcap token slots of B each
             st.m_tokcap = 512
             st.m_map, st.m_mapdev = rk.host_map(8 + st.m_tokcap * B * 8)
-        st.m_i = getattr(st, "m_i", 0)
         rk.step_all(st.m_lw, self.embed_w, self.fin_w, st.cos, st.sin,
                     st.pos, st.cur, st.m_hid, st.m_hbuf, st.m_qkv,
                     st.m_obuf, st.m_gu, st.m_logits, st.m_amaxv,
                     st.m_amaxi, st.m_cnt, st.m_gen, st.m_mapdev,
-                    st.m_mapdev + 8, st.B, NL, st.m_i % st.m_tokcap, EPS,
-                    st.S)
-        st.m_i += 1
+                    st.m_mapdev + 8, st.B, NL, ntok, EPS, st.S)
+        st.m_i = getattr(st, "m_i", 0) + ntok
         self._last_logits = st.m_logits
 
     # ------------------------------------------------------------------
@@ -728,6 +726,8 @@ class Engine:
     def _reset_decode(self, st: _State, prompt_len: int, first: torch.Tensor) -> None:
         st.pos.fill_(prompt_len)
         st.cur.copy_(first.view(st.B, 1))
+        st.m_running = False
+        st.m_j = 0
 
     def _pick_step(self):
         if _HAS_TRITON and not self._step_slow_only:
@@ -1741,26 +1741,37 @@ class Engine:
                     st.spec_cooldown -= 1
                 # st.cur already holds the last emitted token (written
                 # on-device by the previous step) — no H2D needed.
+                if (st.decode_name == 8
+                        and getattr(st, "mega_flag", False)):
+                    # whole-generation megakernel: launch once, then poll a
+                    # host-mapped flag per step — zero CUDA calls in the loop
+                    if not getattr(st, "m_running", False):
+                        st.m_running = True
+                        st.m_total = min(st.m_tokcap,
+                                         max_new_tokens - i)
+                        _t0 = time.perf_counter()
+                        self._decode_all(st, st.m_total)
+                        st.t_run += time.perf_counter() - _t0
+                        st.t_n += 1
+                    mv = st.m_map
+                    j = st.m_j = getattr(st, "m_j", 0)
+                    slot = 1 + j * B
+                    _d0 = time.perf_counter()
+                    while mv[0] < j + 1:
+                        if time.perf_counter() - _d0 > 30.0:
+                            raise RuntimeError("mega_flag_timeout")
+                    st.t_drain += time.perf_counter() - _d0
+                    st.m_j = j + 1
+                    for b in range(B):
+                        queues[b].append(mv[slot + b])
+                        hists[b].append(mv[slot + b])
+                    yield [queues[b][i] for b in range(B)]
+                    i += 1
+                    continue
                 _t0 = time.perf_counter()
                 st.decode_runner()
                 st.t_run += time.perf_counter() - _t0
                 st.t_n += 1
-                if (st.decode_name == 8
-                        and getattr(st, "mega_flag", False)):
-                    # megakernel emits straight to host-mapped memory:
-                    # poll the flag, read the tokens, zero CUDA calls here
-                    target = st.m_i
-                    mv = st.m_map
-                    slot = 1 + ((target - 1) % st.m_tokcap) * B
-                    _d0 = time.perf_counter()
-                    while mv[0] < target:
-                        if time.perf_counter() - _d0 > 30.0:
-                            raise RuntimeError("mega_flag_timeout")
-                    st.t_drain += time.perf_counter() - _d0
-                    for b in range(B):
-                        queues[b].append(mv[slot + b])
-                        hists[b].append(mv[slot + b])
-                    continue
                 if getattr(st, "pinned_ok", True):
                     pi = st.ptog
                     st.pin2[pi].fill_(-1)

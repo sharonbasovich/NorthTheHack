@@ -373,7 +373,7 @@ __device__ __forceinline__ void gbar(unsigned* cnt, volatile unsigned* gen) {
             __threadfence();
             atomicExch((unsigned*)gen, g + 1);
         } else {
-            while (*gen == g) __nanosleep(64);
+            while (*gen == g) { }
         }
     }
     __syncthreads();
@@ -615,16 +615,20 @@ extern "C" __global__ void step_all_k(
         unsigned* __restrict__ gen,
         volatile long long* __restrict__ flag,   // host-mapped
         volatile long long* __restrict__ tokm,   // host-mapped [O*B]
-        int B, int NL, int step_i, float eps, long long cap) {
+        int B, int NL, int ntok, float eps, long long cap) {
     int blk = blockIdx.x, tid = threadIdx.x;
     int nblk = gridDim.x;
     __shared__ float red[NT / 32];
     __shared__ bf16 srope[128];
+    __shared__ float sval[NT / 32];
+    __shared__ int sidx[NT / 32];
     extern __shared__ float scores[];
 
     bf16* h = hbuf;
     bf16* h2 = hbuf + (long long)B * HDIM;
+    int per = nblk / B;
 
+    for (int step_i = 0; step_i < ntok; ++step_i) {
     // embed current token into residual stream
     if (blk < B) {
         long long tok = cur[blk];
@@ -679,9 +683,6 @@ extern "C" __global__ void step_all_k(
     // argmax over logits[b, :VDIM]. Block slice s of row b scans
     // [s*VDIM/per, (s+1)*VDIM/per); per-block winner goes to scratch,
     // then blocks 0..B-1 reduce their row's slice winners.
-    __shared__ float sval[NT / 32];
-    __shared__ int sidx[NT / 32];
-    int per = nblk / B;
     if (blk < B * per) {
         int b = blk % B, s = blk / B;
         int lo = (int)(((long long)s * VDIM) / per);
@@ -721,12 +722,13 @@ extern "C" __global__ void step_all_k(
             if (v > mv || (v == mv && i < mi)) { mv = v; mi = i; }
         }
         cur[blk] = (long long)mi;
-        tokm[(long long)(step_i % 512) * B + blk] = (long long)mi;
+        tokm[(long long)step_i * B + blk] = (long long)mi;
         pos[blk] += 1;
         __threadfence_system();
     }
     gbar(cnt, gen);
     if (blk == 0 && tid == 0) flag[0] = (long long)(step_i + 1);
+    }
 }
 """
 
@@ -896,7 +898,7 @@ class RtcKernels:
 
     def step_all(self, lw, embed, finw, cost, sint, pos, cur, hid, hbuf,
                  qkv, obuf, gu, logits, amaxv, amaxi, cnt, gen,
-                 flag_dev, tokm_dev, B, NL, step_i, eps, cap):
+                 flag_dev, tokm_dev, B, NL, ntok, eps, cap):
         smem = (cap + 8) * 6 + 512
         self.rtc.launch(self.megafn, self.nblk, 256, smem,
                         [ptr(lw), ptr(embed), ptr(finw), ptr(cost),
@@ -906,4 +908,4 @@ class RtcKernels:
                          ptr(cnt), ptr(gen),
                          ctypes.c_void_p(flag_dev),
                          ctypes.c_void_p(tokm_dev),
-                         i32(B), i32(NL), i32(step_i), f32(eps), i64(cap)])
+                         i32(B), i32(NL), i32(ntok), f32(eps), i64(cap)])
