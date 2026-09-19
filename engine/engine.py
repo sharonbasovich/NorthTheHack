@@ -243,6 +243,7 @@ class Engine:
                 }
             )
         self.states = {}
+        self._probes = {}
 
     # ------------------------------------------------------------------
     # Verify pass: R rows per sequence. Emits 1..R tokens/row into emit_dev.
@@ -515,6 +516,39 @@ class Engine:
         except Exception:
             return float("inf")
 
+    def _probe(self, kind: str) -> bool:
+        """Cheap capability probes — a graph capture or compile of a trivial
+        op fails on some runtimes (gVisor); skip the expensive variant then."""
+        cached = self._probes.get(kind)
+        if cached is not None:
+            return cached
+        ok = False
+        try:
+            if kind == "graph":
+                t = torch.zeros(4, device=self.dev)
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    t.add_(1)
+                torch.cuda.current_stream().wait_stream(s)
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    t.add_(1)
+                g.replay()
+                ok = True
+            elif kind == "compile":
+                f = torch.compile(lambda x: x + 1, fullgraph=True)
+                f(torch.zeros(1, device=self.dev))
+                ok = True
+            elif kind == "jit":
+                torch.jit.trace(
+                    lambda x: x + 1, torch.zeros(1, device=self.dev))
+                ok = True
+        except Exception:
+            ok = False
+        self._probes[kind] = ok
+        return ok
+
     def _spec_pass(self, st: _State, queues, hists) -> int:
         """One verify pass: build draft inputs, run graph, append emitted
         tokens to per-row queues and n-gram histories. Returns mean emit count."""
@@ -579,11 +613,14 @@ class Engine:
         candidates = []
         if _HAS_TRITON and not self._step_slow_only:
             candidates.append(("eager_fast", lambda s=st: self._decode_step_fast(s)))
-        candidates.append(("graph_slow", self._decode_step_slow))
-        if _HAS_TRITON and not self._step_slow_only:
-            candidates.append(("graph_fast", self._decode_step_fast))
-        candidates.append(("jit", "jit"))
-        candidates.append(("compile", "compile"))
+        if self._probe("graph"):
+            candidates.append(("graph_slow", self._decode_step_slow))
+            if _HAS_TRITON and not self._step_slow_only:
+                candidates.append(("graph_fast", self._decode_step_fast))
+        if self._probe("jit"):
+            candidates.append(("jit", "jit"))
+        if self._probe("compile"):
+            candidates.append(("compile", "compile"))
 
         for name, what in candidates:
             try:
@@ -647,10 +684,13 @@ class Engine:
             for make in ("jit", "graph", "eager"):
                 try:
                     if make == "jit":
+                        if not self._probe("jit"):
+                            continue
                         runner = torch.jit.trace(
                             lambda: self._decode_step_slow_batch(st), ())
                     elif make == "graph" and (
                         _HAS_TRITON and not self._step_slow_only
+                        and self._probe("graph")
                     ):
                         g = self._capture(st, self._decode_step_spec, 1)
                         runner = g.replay
@@ -682,6 +722,10 @@ class Engine:
 
         # whole-prefill graph: replays identical work per call, verified
         # against the eager prefill's argmax before use.
+        if not self._probe("graph"):
+            st.pre_graph = None
+            st.best = True
+            return
         try:
             st.ids_dev.copy_(ids)
             s = torch.cuda.Stream()
