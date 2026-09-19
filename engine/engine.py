@@ -941,6 +941,14 @@ class Engine:
         restore()
         self._choose_path = 4
 
+    def _decode_step_slow_ret(self, st):
+        self._decode_step_slow(st)
+        return st.cur
+
+    def _decode_step_slow_batch_ret(self, st):
+        self._decode_step_slow_batch(st)
+        return st.emit_dev
+
         candidates = []
         if self._probe("toolchain"):
             candidates.append(("ext", "ext"))
@@ -985,7 +993,7 @@ class Engine:
                     disarm = self._watchdog(30)
                     try:
                         traced = torch.jit.trace(
-                            lambda: self._decode_step_slow(st), ())
+                            lambda: self._decode_step_slow_ret(st), ())
                     finally:
                         disarm()
                     traced()
@@ -1030,7 +1038,7 @@ class Engine:
         try:
             self._decode_step_slow_batch(st)
             self._batch_err = 1
-            ref_logits_b = self._last_logits_b.clone().view(B, R, V)
+            ref_logits_b = self._last_logits_b.clone().view(st.B, R, V)
             self._batch_err = 2
             emit0 = st.emit_dev[:, 0].clone()
             restore()
@@ -1067,7 +1075,8 @@ class Engine:
                         disarm = self._watchdog(30)
                         try:
                             runner = torch.jit.trace(
-                                lambda: self._decode_step_slow_batch(st), ())
+                                lambda: self._decode_step_slow_batch_ret(st),
+                                ())
                         finally:
                             disarm()
                     elif make == "graphb" and self._probe("graph"):
