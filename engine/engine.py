@@ -164,6 +164,12 @@ class _State:
         self.ii = torch.arange(batch, device=dev).view(batch, 1).expand(batch, NKV)
         self.jj = torch.arange(NKV, device=dev).view(1, NKV).expand(batch, NKV)
         self.iB = torch.arange(batch, device=dev)
+        # flat dim-0 row indices into kc/vc viewed as (B*NKV*S, D) —
+        # index_copy_ rows replace index_put_ (capture/trace safe)
+        self.kw1 = ((self.ii * NKV + self.jj) * capacity).reshape(-1)
+        _kvh = torch.arange(NKV, device=dev).view(1, 1, NKV)
+        self.kwr = ((self.iB.view(batch, 1, 1) * NKV + _kvh)
+                    * capacity).expand(batch, R, NKV).contiguous()
         positions = torch.arange(capacity, device=dev, dtype=torch.float32)
         inv = engine.rope_inv_freq.float().to(dev)
         freqs = torch.outer(positions, inv)
@@ -405,12 +411,9 @@ class Engine:
             qke = qkn * cos + _rot_half(qkn) * sin
             qe = qke[:, :, :NQ]
             ke = qke[:, :, NQ:]
-            st.kc[i].index_put_(
-                (st.ii, st.jj, st.pos.view(B, 1).expand(B, NKV)), ke[:, 0]
-            )
-            st.vc[i].index_put_(
-                (st.ii, st.jj, st.pos.view(B, 1).expand(B, NKV)), v[:, 0]
-            )
+            _fl = st.kw1 + st.pos.view(B, 1).expand(B, NKV).reshape(-1)
+            st.kc[i].view(-1, D).index_copy_(0, _fl, ke.reshape(-1, D))
+            st.vc[i].view(-1, D).index_copy_(0, _fl, v.reshape(-1, D))
             qg = qe.reshape(B, NKV, GROUP, D)
             scores = torch.matmul(qg, st.kc[i].transpose(-1, -2)) * SCALE
             scores.masked_fill_(nvalid[:, None, None, :], NEG_INF)
@@ -454,8 +457,9 @@ class Engine:
             qke = qkn * cos + _rot_half(qkn) * sin
             qe = qke[:, :, :NQ]
             ke = qke[:, :, NQ:]
-            st.kc[i].index_put_((bi, gi, pi), ke)
-            st.vc[i].index_put_((bi, gi, pi), v)
+            _fl = (st.kwr + pos_r[:, :, None]).view(-1)
+            st.kc[i].view(-1, D).index_copy_(0, _fl, ke.reshape(-1, D))
+            st.vc[i].view(-1, D).index_copy_(0, _fl, v.reshape(-1, D))
             qg = qe.reshape(B, R, NKV, GROUP, D)
             scores = torch.matmul(
                 qg, st.kc[i].unsqueeze(1).transpose(-1, -2)
@@ -657,17 +661,7 @@ class Engine:
         cached = self._probes.get(kind)
         if cached is not None:
             return cached
-        # probe results are shape-independent: reuse across processes
-        try:
-            f = open("/tmp/kr_probes.json")
-            import json as _j
-            res = _j.load(f)
-            f.close()
-            if kind in res:
-                self._probes[kind] = res[kind]
-                return res[kind]
-        except Exception:
-            res = {}
+        res = {}
         ok = False
         try:
             if kind == "graph":
@@ -697,13 +691,6 @@ class Engine:
         except Exception:
             ok = False
         self._probes[kind] = ok
-        try:
-            import json as _j
-            res[kind] = ok
-            with open("/tmp/kr_probes.json", "w") as f:
-                _j.dump(res, f)
-        except Exception:
-            pass
         return ok
 
     def _load_ext(self, st: _State):
@@ -864,8 +851,9 @@ class Engine:
                 qe = qke[:, :, :NQ]
                 ke = qke[:, :, NQ:]
                 mark(5)
-                st.kc[i].index_put_((bi, gi, pi), ke)
-                st.vc[i].index_put_((bi, gi, pi), v)
+                _fl = (st.kwr + pos_r[:, :, None]).view(-1)
+                st.kc[i].view(-1, D).index_copy_(0, _fl, ke.reshape(-1, D))
+                st.vc[i].view(-1, D).index_copy_(0, _fl, v.reshape(-1, D))
                 mark(6)
                 qg = qe.reshape(B, R, NKV, GROUP, D)
                 mark(7)
@@ -1285,10 +1273,9 @@ class Engine:
             qke = qkn * cos + _rot_half(qkn) * sin
             qe = qke[:, :, :NQ]
             ke = qke[:, :, NQ:]
-            st.kc[i].index_put_(
-                (st.ii, st.jj, st.pos.view(B, 1).expand(B, NKV)), ke[:, 0])
-            st.vc[i].index_put_(
-                (st.ii, st.jj, st.pos.view(B, 1).expand(B, NKV)), v[:, 0])
+            _fl = st.kw1 + st.pos.view(B, 1).expand(B, NKV).reshape(-1)
+            st.kc[i].view(-1, D).index_copy_(0, _fl, ke.reshape(-1, D))
+            st.vc[i].view(-1, D).index_copy_(0, _fl, v.reshape(-1, D))
             qg = qe.reshape(B, NKV, GROUP, D)
             scores = torch.matmul(qg, st.kc[i].transpose(-1, -2)) * SCALE
             scores.masked_fill_(nvalid[:, None, None, :], NEG_INF)
@@ -1328,8 +1315,9 @@ class Engine:
             qke = qkn * cos + _rot_half(qkn) * sin
             qe = qke[:, :, :NQ]
             ke = qke[:, :, NQ:]
-            st.kc[i].index_put_((bi, gi, pi), ke)
-            st.vc[i].index_put_((bi, gi, pi), v)
+            _fl = (st.kwr + pos_r[:, :, None]).view(-1)
+            st.kc[i].view(-1, D).index_copy_(0, _fl, ke.reshape(-1, D))
+            st.vc[i].view(-1, D).index_copy_(0, _fl, v.reshape(-1, D))
             qg = qe.reshape(B, R, NKV, GROUP, D)
             scores = torch.matmul(
                 qg, st.kc[i].unsqueeze(1).transpose(-1, -2)) * SCALE
