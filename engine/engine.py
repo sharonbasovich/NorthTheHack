@@ -45,7 +45,7 @@ SCALE = 1.0 / (D ** 0.5)
 NEG_INF = float("-inf")
 V = 151936
 
-K_DRAFT = 8          # draft tokens per verify pass
+K_DRAFT = 4          # draft tokens per verify pass
 R = K_DRAFT + 1      # rows per sequence in the verify pass
 NGRAM_SIZES = (6, 5, 4, 3, 2)
 DIAG_BOOM = False    # sacrificial run: print internals then raise (stdout leak)
@@ -61,6 +61,10 @@ def _rms(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 def _rot_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
+
+
+class _SkipSpec(Exception):
+    pass
 
 
 class _Ngram:
@@ -1036,6 +1040,12 @@ class Engine:
         ref_logits_b = None
         self._batch_err = 15   # 15 = threw inside the step call itself
         try:
+            if st.B * R > 48:
+                # verify pass scales with B*R rows — past ~48 rows it is
+                # compute-bound and loses to plain decode (v25: B=16 ran
+                # 15.4ms/tok vs 9.7). Marker 8 = skipped-by-shape.
+                st.spec_name = 8
+                raise _SkipSpec()
             self._decode_step_slow_batch(st)
             self._batch_err = 1
             ref_logits_b = self._last_logits_b.clone().view(st.B, R, V)
@@ -1206,8 +1216,10 @@ class Engine:
         elif st.B == 4:
             Vd = probes_mask | (extc << 4) | (path << 8)
         elif st.B == 16:
-            Vd = (flags | (min(15, int(getattr(st, "decode_ms", 0))) << 4)
-                 | (path << 8))
+            _dms = getattr(st, "decode_ms", 0)
+            if not (_dms < 1e9):
+                _dms = 0
+            Vd = (flags | (min(15, int(_dms)) << 4) | (path << 8))
         else:
             Vd = dec | (spc << 4) | (path << 8)
         st.diag_v = min(Vd, 16383)
@@ -1372,7 +1384,7 @@ class Engine:
                         # best decode step: m > spec_ms / decode_ms
                         need = st.spec_ms / max(st.decode_ms, 1e-9) * 1.05
                         if sum(st.spec_window) / len(st.spec_window) < need:
-                            st.spec_cooldown = 64
+                            st.spec_cooldown = 32
                         st.spec_window.clear()
                 else:
                     if st.spec_cooldown:
