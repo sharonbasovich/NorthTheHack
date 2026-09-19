@@ -1137,11 +1137,6 @@ class Engine:
         self._choose_path = 4
 
         candidates = []
-        # try the graph capture even when the probe failed — probes have
-        # been flaky under gVisor and a real capture attempt fails fast.
-        candidates.append(("graph_slow", self._decode_step_slow))
-        if _HAS_TRITON and not self._step_slow_only:
-            candidates.append(("graph_fast", self._decode_step_fast))
         if self._rtk is None:
             try:
                 from kernels.rtc import RtcKernels
@@ -1151,6 +1146,8 @@ class Engine:
                 self._rtk = False
                 self._rtc_status = 4
         if self._rtk:
+            # mega first: it is the best path when it works and must never
+            # be starved by a slow graph-capture attempt ahead of it
             if st.B <= getattr(self._rtk, "nblk", 0):
                 candidates.append(("mega_all",
                                    lambda s=st: self._decode_all(s)))
@@ -1158,6 +1155,11 @@ class Engine:
                                lambda s=st: self._decode_step_rtc2(s)))
             candidates.append(("eager_rtc",
                                lambda s=st: self._decode_step_rtc(s)))
+        # try the graph capture even when the probe failed — probes have
+        # been flaky under gVisor and a real capture attempt fails fast.
+        candidates.append(("graph_slow", self._decode_step_slow))
+        if _HAS_TRITON and not self._step_slow_only:
+            candidates.append(("graph_fast", self._decode_step_fast))
         candidates.append(("eager_sdpa",
                            lambda s=st: self._decode_step_sdpa(s)))
         if self._probe("toolchain"):
