@@ -1,18 +1,19 @@
 """Optimized Qwen3 4B engine: native-exact prefill into a static KV cache,
-then a single CUDA-graph-captured decode step built from fused Triton
-kernels + cuBLAS GEMMs.
+then speculative decode with exact verification, captured as CUDA graphs.
 
-Same math as the baseline, reorganized for speed:
+Pipeline:
 - prefill runs the pinned Transformers layers once, writing K/V directly into
-  preallocated contiguous cache buffers (no per-step concatenation);
-- decode replays a captured graph per step: embedding, fused QKV GEMM,
-  one Triton kernel for per-head RMSNorm + RoPE + K/V cache scatter, a
-  flash-decode Triton attention (K/V read once per KV head, fp32 online
-  softmax), fused gate/up GEMM, fused SiLU-mul, final norm, tied LM head,
-  argmax written back into the input buffer;
-- RoPE row, cache slot, and attention length all come from a device-side
-  position counter, so the graph stays correct as it advances;
-- per-step host readback is one tiny pinned-memory copy outside the graph.
+  preallocated contiguous cache buffers;
+- decode is a captured graph of fused Triton kernels + cuBLAS GEMMs;
+- a verify pass runs R = K+1 rows per sequence (the confirmed last token plus
+  K draft tokens from an n-gram prompt-lookup), producing per-row argmaxes;
+  the leading run where each draft equals the previous row's argmax is
+  accepted — every emitted token is the model's greedy choice on its true
+  prefix, so outputs are identical to sequential greedy decode;
+- positions live in a device-side per-batch counter, so a captured graph
+  replays correctly as positions advance by variable amounts;
+- per-step host traffic is two tiny pinned copies (draft inputs in,
+  emitted tokens out).
 
 Numerics match native: fp32 norm accumulation with the same cast placement,
 bf16 rope tables identical to the model's own rotary module, fp32 softmax,
@@ -41,6 +42,10 @@ SCALE = 1.0 / (D ** 0.5)
 NEG_INF = float("-inf")
 V = 151936
 
+K_DRAFT = 4          # draft tokens per verify pass
+R = K_DRAFT + 1      # rows per sequence in the verify pass
+NGRAM_SIZES = (4, 3, 2)
+
 
 def _rms(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """Qwen3RMSNorm semantics: fp32 reduce, cast to bf16, then weight mul."""
@@ -52,6 +57,44 @@ def _rms(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 def _rot_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
+
+
+class _Ngram:
+    """Per-row n-gram index over prompt + emitted tokens for prompt-lookup
+    drafting. Maps each n-gram to the positions it starts at, most recent last."""
+
+    def __init__(self, hist):
+        self.hist = list(hist)
+        self.index = {}
+        for i in range(len(self.hist)):
+            self._add(i)
+
+    def _add(self, i):
+        h = self.hist
+        for n in NGRAM_SIZES:
+            if i + n <= len(h):
+                self.index.setdefault(tuple(h[i : i + n]), []).append(i)
+
+    def append(self, tok):
+        self.hist.append(tok)
+        self._add(len(self.hist) - 1)
+
+    def draft(self, k):
+        """Up to k continuation tokens after the most recent earlier occurrence
+        of the longest matching suffix; [] when nothing matches."""
+        L = len(self.hist)
+        for n in NGRAM_SIZES:
+            if L <= n:
+                continue
+            cands = self.index.get(tuple(self.hist[L - n :]))
+            if not cands:
+                continue
+            for i in reversed(cands):
+                if i + n < L:  # occurrence with a following token
+                    out = self.hist[i + n : i + n + k]
+                    if out:
+                        return out
+        return []
 
 
 class _PrefillCache:
@@ -89,12 +132,16 @@ class _PrefillCache:
 
 
 class _State:
-    """Per-(batch, capacity) buffers plus the captured decode graph."""
+    """Per-(batch, prompt+output length) buffers plus captured graphs.
+
+    `rows` scratch is sized for R rows per sequence (the verify pass);
+    the single-token step uses the leading B rows.
+    """
 
     def __init__(self, engine, batch, capacity):
         dev = engine.dev
         self.B = batch
-        self.S = capacity
+        self.S = capacity           # includes slack for overshoot writes
         self.kc = [
             torch.zeros(batch, NKV, capacity, D, dtype=torch.bfloat16, device=dev)
             for _ in range(NL)
@@ -104,10 +151,10 @@ class _State:
             for _ in range(NL)
         ]
         self.cur = torch.zeros(batch, 1, dtype=torch.int64, device=dev)
-        self.pos = torch.zeros(1, dtype=torch.int64, device=dev)
-        self.mask = torch.full(
-            (capacity,), NEG_INF, dtype=torch.bfloat16, device=dev
-        )
+        self.pos = torch.zeros(batch, dtype=torch.int64, device=dev)
+        self.srange = torch.arange(capacity, device=dev)
+        self.ii = torch.arange(batch, device=dev).view(batch, 1).expand(batch, NKV)
+        self.jj = torch.arange(NKV, device=dev).view(1, NKV).expand(batch, NKV)
         positions = torch.arange(capacity, device=dev, dtype=torch.float32)
         inv = engine.model.model.rotary_emb.inv_freq.float().to(dev)
         freqs = torch.outer(positions, inv)
@@ -115,19 +162,28 @@ class _State:
         self.cos = emb.cos().to(torch.bfloat16)
         self.sin = emb.sin().to(torch.bfloat16)
         self.pin = torch.empty(batch, dtype=torch.int64, pin_memory=True)
-        # fused-path scratch buffers
-        self.x = torch.zeros(batch, H, dtype=torch.bfloat16, device=dev)
-        self.h = torch.zeros(batch, H, dtype=torch.bfloat16, device=dev)
-        self.h2 = torch.zeros(batch, H, dtype=torch.bfloat16, device=dev)
-        self.qkv = torch.zeros(batch, (NQ + 2 * NKV) * D, dtype=torch.bfloat16, device=dev)
-        self.qe = torch.zeros(batch, NQ * D, dtype=torch.bfloat16, device=dev)
-        self.o4 = torch.zeros(batch, NQ * D, dtype=torch.bfloat16, device=dev)
-        self.att = torch.zeros(batch, H, dtype=torch.bfloat16, device=dev)
-        self.gu = torch.zeros(batch, 2 * I, dtype=torch.bfloat16, device=dev)
-        self.m = torch.zeros(batch, I, dtype=torch.bfloat16, device=dev)
-        self.dn = torch.zeros(batch, H, dtype=torch.bfloat16, device=dev)
-        self.logits = torch.zeros(batch, V, dtype=torch.bfloat16, device=dev)
-        self.graph = None
+        # fused-path scratch, sized for R rows/sequence
+        n = batch * R
+        self.x = torch.zeros(n, H, dtype=torch.bfloat16, device=dev)
+        self.h = torch.zeros(n, H, dtype=torch.bfloat16, device=dev)
+        self.h2 = torch.zeros(n, H, dtype=torch.bfloat16, device=dev)
+        self.qkv = torch.zeros(n, (NQ + 2 * NKV) * D, dtype=torch.bfloat16, device=dev)
+        self.qe = torch.zeros(n, NQ * D, dtype=torch.bfloat16, device=dev)
+        self.o4 = torch.zeros(n, NQ * D, dtype=torch.bfloat16, device=dev)
+        self.att = torch.zeros(n, H, dtype=torch.bfloat16, device=dev)
+        self.gu = torch.zeros(n, 2 * I, dtype=torch.bfloat16, device=dev)
+        self.mlp = torch.zeros(n, I, dtype=torch.bfloat16, device=dev)
+        self.dn = torch.zeros(n, H, dtype=torch.bfloat16, device=dev)
+        self.logits = torch.zeros(n, V, dtype=torch.bfloat16, device=dev)
+        # speculative verify inputs / outputs
+        self.inp = torch.zeros(batch, R, dtype=torch.int64, device=dev)
+        self.inp_pin = torch.empty(batch, R, dtype=torch.int64, pin_memory=True)
+        self.emit_dev = torch.zeros(batch, R + 1, dtype=torch.int64, device=dev)
+        self.emit_pin = torch.empty(batch, R + 1, dtype=torch.int64, pin_memory=True)
+        self.graph = None            # verify-pass graph (R rows)
+        self.graph1 = None           # plain decode graph (R=1 rows)
+        self.spec_cooldown = 0       # passes to run decode-only (weak drafting)
+        self.spec_window = []        # recent emit counts for adaptivity
 
 
 class Engine:
@@ -172,44 +228,80 @@ class Engine:
         self.states = {}
 
     # ------------------------------------------------------------------
-    # Decode step, fused-Triton version.
+    # Verify pass: R rows per sequence. Emits 1..R tokens/row into emit_dev.
     # ------------------------------------------------------------------
-    def _decode_step_fast(self, st: _State) -> None:
-        torch.index_select(self.embed_w, 0, st.cur[:, 0], out=st.x)
+    def _decode_step_spec(self, st: _State) -> None:
+        B = st.B
+        torch.index_select(self.embed_w, 0, st.inp.view(-1), out=st.x)
         FK.rmsnorm(st.x, self.layers[0]["ln_in"], st.h, EPS)
         for i, w in enumerate(self.layers):
             torch.matmul(st.h, w["wqkv"].t(), out=st.qkv)
             FK.qknorm_rope_cache(
                 st.qkv, w["qn"], w["kn"], st.cos, st.sin,
-                st.kc[i], st.vc[i], st.qe, st.pos, EPS, NQ, NKV, D,
+                st.kc[i], st.vc[i], st.qe, st.pos, EPS, NQ, NKV, D, R,
             )
             FK.attn_decode(
                 st.qe, st.kc[i], st.vc[i], st.o4, st.pos,
-                NKV, GROUP, D, SCALE,
+                NKV, GROUP, D, SCALE, R,
             )
             torch.matmul(st.o4, w["wo"].t(), out=st.att)
             FK.add_rmsnorm(st.x, st.att, st.h2, w["ln_post"], EPS)
             torch.matmul(st.h2, w["wgu"].t(), out=st.gu)
-            FK.silu_mul(st.gu, st.m, I)
-            torch.matmul(st.m, w["wd"].t(), out=st.dn)
+            FK.silu_mul(st.gu, st.mlp, I)
+            torch.matmul(st.mlp, w["wd"].t(), out=st.dn)
             next_w = (
                 self.layers[i + 1]["ln_in"] if i + 1 < NL else self.fin_w
             )
             FK.add_rmsnorm(st.x, st.dn, st.h, next_w, EPS)
         torch.matmul(st.h, self.lm_w.t(), out=st.logits)
-        tok = st.logits.argmax(dim=-1)
-        st.cur.copy_(tok.view(st.B, 1))
+        am = st.logits.view(B, R, V).argmax(dim=-1)       # [B,R] token ids
+        matched = (am[:, :-1] == st.inp[:, 1:]).to(torch.int64)
+        m = matched.cumprod(dim=1).sum(dim=1) + 1        # [B], 1..R
+        st.pos.add_(m)
+        torch.cat([am, m.view(B, 1)], dim=1, out=st.emit_dev)
+
+    # ------------------------------------------------------------------
+    # Single-token fused step (same kernels, R=1 view of the buffers).
+    # ------------------------------------------------------------------
+    def _decode_step_fast(self, st: _State) -> None:
+        B = st.B
+        x = st.x[:B]
+        h = st.h[:B]
+        torch.index_select(self.embed_w, 0, st.cur[:, 0], out=x)
+        FK.rmsnorm(x, self.layers[0]["ln_in"], h, EPS)
+        for i, w in enumerate(self.layers):
+            torch.matmul(h, w["wqkv"].t(), out=st.qkv[:B])
+            FK.qknorm_rope_cache(
+                st.qkv[:B], w["qn"], w["kn"], st.cos, st.sin,
+                st.kc[i], st.vc[i], st.qe[:B], st.pos, EPS, NQ, NKV, D, 1,
+            )
+            FK.attn_decode(
+                st.qe[:B], st.kc[i], st.vc[i], st.o4[:B], st.pos,
+                NKV, GROUP, D, SCALE, 1,
+            )
+            torch.matmul(st.o4[:B], w["wo"].t(), out=st.att[:B])
+            FK.add_rmsnorm(x, st.att[:B], st.h2[:B], w["ln_post"], EPS)
+            torch.matmul(st.h2[:B], w["wgu"].t(), out=st.gu[:B])
+            FK.silu_mul(st.gu[:B], st.mlp[:B], I)
+            torch.matmul(st.mlp[:B], w["wd"].t(), out=st.dn[:B])
+            next_w = (
+                self.layers[i + 1]["ln_in"] if i + 1 < NL else self.fin_w
+            )
+            FK.add_rmsnorm(x, st.dn[:B], h, next_w, EPS)
+        torch.matmul(h, self.lm_w.t(), out=st.logits[:B])
+        tok = st.logits[:B].argmax(dim=-1)
+        st.cur.copy_(tok.view(B, 1))
         st.pos.add_(1)
 
     # ------------------------------------------------------------------
-    # Decode step, plain-torch fallback (same math, more kernels).
+    # Plain-torch single-token fallback (same math, more kernels).
     # ------------------------------------------------------------------
     def _decode_step_slow(self, st: _State) -> None:
         B = st.B
         x = F.embedding(st.cur, self.embed_w)  # [B,1,H]
-        cos = st.cos.index_select(0, st.pos).view(1, 1, 1, D)
-        sin = st.sin.index_select(0, st.pos).view(1, 1, 1, D)
-        pos1 = st.pos.view(1)
+        cos = st.cos.index_select(0, st.pos).view(B, 1, 1, D)
+        sin = st.sin.index_select(0, st.pos).view(B, 1, 1, D)
+        valid = st.srange[None, :] <= st.pos[:, None]
         for i, w in enumerate(self.layers):
             h = _rms(x, w["ln_in"]).view(B, H)
             qkv = h @ w["wqkv"].t()
@@ -220,12 +312,15 @@ class Engine:
             kn = _rms(k, w["kn"])
             qe = qn * cos + _rot_half(qn) * sin
             ke = kn * cos + _rot_half(kn) * sin
-            st.kc[i].index_copy_(2, pos1, ke.transpose(1, 2))
-            st.vc[i].index_copy_(2, pos1, v.transpose(1, 2))
-            st.mask.index_fill_(0, pos1, 0.0)
+            st.kc[i].index_put_(
+                (st.ii, st.jj, st.pos.view(B, 1).expand(B, NKV)), ke[:, 0]
+            )
+            st.vc[i].index_put_(
+                (st.ii, st.jj, st.pos.view(B, 1).expand(B, NKV)), v[:, 0]
+            )
             qg = qe.view(B, NKV, GROUP, D)
             scores = torch.matmul(qg, st.kc[i].transpose(-1, -2)) * SCALE
-            scores = scores + st.mask.view(1, 1, 1, st.S)
+            scores.masked_fill_(~valid[:, None, None, :], NEG_INF)
             p = torch.softmax(scores.float(), dim=-1).to(torch.bfloat16)
             o = torch.matmul(p, st.vc[i]).view(B, 1, NQ * D)
             x = x + (o.view(B, NQ * D) @ w["wo"].t()).view(B, 1, H)
@@ -263,52 +358,61 @@ class Engine:
         logits = self.model.lm_head(x[:, -1, :])
         return logits.argmax(dim=-1)
 
-    def _get_state(self, batch: int, capacity: int) -> _State:
-        key = (batch, capacity)
+    def _get_state(self, batch: int, slack: int) -> _State:
+        key = (batch, slack)
         st = self.states.get(key)
         if st is None:
-            st = _State(self, batch, capacity)
+            st = _State(self, batch, slack)
             self.states[key] = st
         return st
 
     def _reset_decode(self, st: _State, prompt_len: int, first: torch.Tensor) -> None:
-        st.mask.fill_(NEG_INF)
-        st.mask[:prompt_len] = 0.0
         st.pos.fill_(prompt_len)
         st.cur.copy_(first.view(st.B, 1))
 
     def _pick_step(self):
-        if _HAS_TRITON and not getattr(self, "_step_slow_only", False):
+        if _HAS_TRITON and not self._step_slow_only:
             return self._decode_step_fast
         return self._decode_step_slow
 
     def _self_check(self, st: _State) -> None:
-        """Cross-validate the fused step against the torch step on live state.
+        """Cross-validate the verify and fused steps against the torch step.
 
-        Runs the fast step once, rewinds pos/cur, runs the slow step, and
-        compares the emitted token. Any exception or disagreement disables the
-        fused path for the rest of the process. Cheap: two extra decode steps,
-        only once per (batch, capacity) state.
+        Runs each on the same (cur, pos), rewinds, and compares the first
+        emitted token. Any exception or disagreement disables fused paths.
+        Cheap: a handful of extra steps, once per state.
         """
         if self._step_slow_only or not _HAS_TRITON:
             return
         try:
             c0 = st.cur.clone()
             p0 = st.pos.clone()
+
+            # verify pass, all-junk drafts: only the first emitted token counts
+            st.inp.fill_(0)
+            st.inp[:, 0] = c0[:, 0]
+            self._decode_step_spec(st)
+            tok_spec = st.emit_dev[:, 0].clone()
+
+            st.cur.copy_(c0)
+            st.pos.copy_(p0)
             self._decode_step_fast(st)
             tok_fast = st.cur.clone()
+
             st.cur.copy_(c0)
             st.pos.copy_(p0)
             self._decode_step_slow(st)
             tok_slow = st.cur.clone()
+
             st.cur.copy_(c0)
             st.pos.copy_(p0)
-            if not torch.equal(tok_fast, tok_slow):
+            if not (torch.equal(tok_spec.view(-1), tok_slow.view(-1))
+                    and torch.equal(tok_fast.view(-1), tok_slow.view(-1))):
                 self._step_slow_only = True
         except Exception:
             self._step_slow_only = True
 
-    def _capture(self, st: _State, step, iters: int) -> None:
+    def _capture(self, st: _State, step, iters: int) -> torch.cuda.CUDAGraph:
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
@@ -318,49 +422,101 @@ class Engine:
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             step(st)
-        st.graph = g
+        return g
+
+    def _spec_pass(self, st: _State, queues, hists) -> int:
+        """One verify pass: build draft inputs, run graph, append emitted
+        tokens to per-row queues and n-gram histories. Returns mean emit count."""
+        B = st.B
+        K = R - 1
+        rows = []
+        for b in range(B):
+            draft = hists[b].draft(K) or [queues[b][-1]]
+            rows.append([queues[b][-1]] + draft + [0] * (K - len(draft)))
+        st.inp_pin.copy_(torch.tensor(rows, dtype=torch.int64))
+        st.inp.copy_(st.inp_pin, non_blocking=True)
+        if st.graph is not None:
+            st.graph.replay()
+        else:
+            self._decode_step_spec(st)
+        st.emit_pin.copy_(st.emit_dev, non_blocking=True)
+        torch.cuda.synchronize()
+        ep = st.emit_pin
+        tot = 0
+        for b in range(B):
+            m_b = int(ep[b, R].item())
+            tot += m_b
+            for j in range(m_b):
+                t = int(ep[b, j].item())
+                queues[b].append(t)
+                hists[b].append(t)
+        return tot / B
 
     @torch.inference_mode()
     def generate(self, input_ids: list[list[int]], max_new_tokens: int):
         ids = torch.tensor(input_ids, dtype=torch.int64, device=self.dev)
         B, L = ids.shape
-        st = self._get_state(B, L + max_new_tokens)
+        # capacity: prompt + outputs + verify overshoot + warmup/capture writes
+        st = self._get_state(B, L + max_new_tokens + 2 * R + 8)
         first = self._prefill(st, ids)
         self._reset_decode(st, L, first)
 
-        if st.graph is None:
+        if st.graph is None and st.graph1 is None:
             self._self_check(st)
             self._reset_decode(st, L, first)
-            # warmup+capture need `iters+1` spare cache slots past pos=L.
-            spare = max_new_tokens - 2
-            iters = max(0, min(2, spare - 1))
             try:
-                if spare >= 1:
-                    self._capture(st, self._pick_step(), iters)
-                else:
-                    st.graph = False
+                st.graph1 = self._capture(st, self._pick_step(), 2)
+                if not self._step_slow_only:
+                    try:
+                        st.graph = self._capture(st, self._decode_step_spec, 2)
+                    except Exception:
+                        st.graph = None
             except Exception:
+                st.graph1 = False
                 if not self._step_slow_only:
                     self._step_slow_only = True
                     self._reset_decode(st, L, first)
                     try:
-                        if spare >= 1:
-                            self._capture(st, self._decode_step_slow, iters)
-                        else:
-                            st.graph = False
+                        st.graph1 = self._capture(st, self._decode_step_slow, 2)
                     except Exception:
-                        st.graph = False
-                else:
-                    st.graph = False
+                        st.graph1 = False
             self._reset_decode(st, L, first)
 
+        queues = [[t] for t in first.tolist()]
+        hists = [_Ngram(row) for row in input_ids]
+        for b in range(B):
+            hists[b].append(queues[b][0])
+
         use_fast = not self._step_slow_only and _HAS_TRITON
-        yield first.tolist()
-        for _ in range(max_new_tokens - 1):
-            if st.graph:
-                st.graph.replay()
-            else:
-                (self._decode_step_fast if use_fast else self._decode_step_slow)(st)
-            st.pin.copy_(st.cur[:, 0], non_blocking=True)
-            torch.cuda.synchronize()
-            yield st.pin.tolist()
+        i = 0
+        while i < max_new_tokens:
+            while min(len(q) for q in queues) <= i:
+                if (use_fast and st.graph is not None
+                        and st.spec_cooldown == 0):
+                    m_mean = self._spec_pass(st, queues, hists)
+                    st.spec_window.append(m_mean)
+                    if len(st.spec_window) >= 12:
+                        # verify pays only if it emits more per pass than it
+                        # costs vs a plain decode step; attention work scales
+                        # with R, so at big batch*ctx a m<~1.5 mean can lose.
+                        if sum(st.spec_window) / len(st.spec_window) < 1.25:
+                            st.spec_cooldown = 64
+                        st.spec_window.clear()
+                else:
+                    if st.spec_cooldown:
+                        st.spec_cooldown -= 1
+                    for b in range(B):
+                        st.cur[b, 0] = queues[b][-1]
+                    if st.graph1:
+                        st.graph1.replay()
+                    else:
+                        (self._decode_step_fast if use_fast
+                         else self._decode_step_slow)(st)
+                    st.pin.copy_(st.cur[:, 0], non_blocking=True)
+                    torch.cuda.synchronize()
+                    for b in range(B):
+                        t = int(st.pin[b].item())
+                        queues[b].append(t)
+                        hists[b].append(t)
+            yield [queues[b][i] for b in range(B)]
+            i += 1

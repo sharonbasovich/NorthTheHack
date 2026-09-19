@@ -1,4 +1,4 @@
-"""Triton kernels for the fused decode step.
+"""Triton kernels for the fused decode / verify step.
 
 Arithmetic mirrors the reference exactly:
 - RMSNorm reduces in fp32, casts the normalized value to bf16, then multiplies
@@ -6,8 +6,10 @@ Arithmetic mirrors the reference exactly:
 - RoPE multiplies bf16 tensors with the model's own cos/sin tables;
 - attention is a flash-decode single pass with fp32 online softmax, grouped so
   each program handles one KV head and its 4 query heads (K/V read once);
-- device-side `pos` drives the RoPE row, the cache slot, and the attention
-  length, so a captured graph replays correctly as pos advances.
+- positions come from a device-side per-batch `pos` counter: row `br` of the
+  batch works at position pos[br // R] + (br % R), so a captured graph replays
+  correctly as positions advance and speculative verify rows land on their own
+  cache slots.
 """
 
 import torch
@@ -68,14 +70,16 @@ def _qknorm_rope_cache_kernel(
     stride_qkv, stride_kc_b, stride_kc_g, stride_qo_b,
     eps,
     Q_OFF: tl.constexpr, K_OFF: tl.constexpr, V_OFF: tl.constexpr,
-    GROUP: tl.constexpr, D: tl.constexpr,
+    GROUP: tl.constexpr, D: tl.constexpr, R: tl.constexpr,
 ):
-    g = tl.program_id(0)   # kv head
-    b = tl.program_id(1)   # batch row
-    pos = tl.load(pos_ptr)
+    g = tl.program_id(0)    # kv head
+    br = tl.program_id(1)   # batch row * R + row-in-block
+    b = br // R
+    t = br % R
+    pos = tl.load(pos_ptr + b) + t  # this row's sequence position
     cols = tl.arange(0, D)
     half = cols < D // 2
-    row = qkv_ptr + b * stride_qkv
+    row = qkv_ptr + br * stride_qkv
 
     cos = tl.load(cos_ptr + pos * D + cols)
     sin = tl.load(sin_ptr + pos * D + cols)
@@ -85,11 +89,13 @@ def _qknorm_rope_cache_kernel(
     kraw = tl.load(ksrc).to(tl.float32)
     kvar = tl.sum(kraw * kraw, axis=0) / D
     kinv = tl.math.rsqrt(kvar + eps)
-    kn = (kraw * kinv).to(tl.bfloat16)
+    # normed -> bf16 -> *weight, matching Qwen3RMSNorm's cast placement
+    kn = (kraw * kinv).to(tl.bfloat16) * tl.load(knw_ptr + cols)
     # rotate_half(kn): lane c<64 takes -kn[c+64], c>=64 takes kn[c-64].
-    # bf16(k_partner * inv) equals the already-rounded normed partner exactly.
+    # bf16(k_partner * inv) * w_partner equals the rounded, weighted partner.
     kpart = tl.load(ksrc + tl.where(half, D // 2, -D // 2)).to(tl.float32)
-    knp = (kpart * kinv).to(tl.bfloat16)
+    knp = (kpart * kinv).to(tl.bfloat16) * tl.load(
+        knw_ptr + cols + tl.where(half, D // 2, -D // 2))
     krot = tl.where(half, -knp, knp)
     ke = (kn * cos + krot * sin).to(tl.bfloat16)
     tl.store(kc_ptr + b * stride_kc_b + g * stride_kc_g + pos * D + cols, ke)
@@ -104,23 +110,23 @@ def _qknorm_rope_cache_kernel(
         qraw = tl.load(qsrc).to(tl.float32)
         qvar = tl.sum(qraw * qraw, axis=0) / D
         qinv = tl.math.rsqrt(qvar + eps)
-        qn = (qraw * qinv).to(tl.bfloat16)
+        qn = (qraw * qinv).to(tl.bfloat16) * tl.load(qnw_ptr + cols)
         qpart = tl.load(qsrc + tl.where(half, D // 2, -D // 2)).to(tl.float32)
-        qnp = (qpart * qinv).to(tl.bfloat16)
+        qnp = (qpart * qinv).to(tl.bfloat16) * tl.load(
+            qnw_ptr + cols + tl.where(half, D // 2, -D // 2))
         qrot = tl.where(half, -qnp, qnp)
         qe = (qn * cos + qrot * sin).to(tl.bfloat16)
-        tl.store(qout_ptr + b * stride_qo_b + (g * GROUP + j) * D + cols, qe)
+        tl.store(qout_ptr + br * stride_qo_b + (g * GROUP + j) * D + cols, qe)
 
 
 def qknorm_rope_cache(qkv, qnw, knw, cos, sin, kc, vc, qout, pos,
-                      eps, nq, nkv, d):
-    B = qkv.shape[0]
-    _qknorm_rope_cache_kernel[(nkv, B)](
+                      eps, nq, nkv, d, r):
+    _qknorm_rope_cache_kernel[(nkv, qkv.shape[0])](
         qkv, qnw, knw, cos, sin, kc, vc, qout, pos,
         qkv.stride(0), kc.stride(0), kc.stride(1), qout.stride(0),
         eps,
         Q_OFF=0, K_OFF=nq * d, V_OFF=nq * d + nkv * d,
-        GROUP=nq // nkv, D=d,
+        GROUP=nq // nkv, D=d, R=r,
         num_warps=4,
     )
 
@@ -130,17 +136,19 @@ def _attn_decode_kernel(
     q_ptr, kc_ptr, vc_ptr, out_ptr, pos_ptr,
     stride_q_b, stride_kc_b, stride_kc_g, stride_o_b,
     scale, GROUP: tl.constexpr, D: tl.constexpr,
-    BLOCK_S: tl.constexpr, PADM: tl.constexpr,
+    BLOCK_S: tl.constexpr, PADM: tl.constexpr, R: tl.constexpr,
 ):
     g = tl.program_id(0)
-    b = tl.program_id(1)
-    pos = tl.load(pos_ptr)
+    br = tl.program_id(1)
+    b = br // R
+    t = br % R
+    pos = tl.load(pos_ptr + b) + t
     length = pos + 1
 
     cols = tl.arange(0, D)
     rows = tl.arange(0, PADM)
     rmask = rows < GROUP
-    qb = q_ptr + b * stride_q_b + g * GROUP * D
+    qb = q_ptr + br * stride_q_b + g * GROUP * D
     q = tl.load(qb + rows[:, None] * D + cols[None, :],
                 mask=rmask[:, None], other=0.0)  # [PADM, D] bf16
 
@@ -168,17 +176,17 @@ def _attn_decode_kernel(
         m_i = m_new
 
     out = acc / l_i[:, None]
-    ob = out_ptr + b * stride_o_b + g * GROUP * D
+    ob = out_ptr + br * stride_o_b + g * GROUP * D
     tl.store(ob + rows[:, None] * D + cols[None, :],
              out.to(tl.bfloat16), mask=rmask[:, None])
 
 
-def attn_decode(q, kc, vc, out, pos, nkv, group, d, scale, block_s=128):
+def attn_decode(q, kc, vc, out, pos, nkv, group, d, scale, r, block_s=128):
     padm = max(16, triton.next_power_of_2(group))
     _attn_decode_kernel[(nkv, q.shape[0])](
         q, kc, vc, out, pos,
         q.stride(0), kc.stride(0), kc.stride(1), out.stride(0),
-        scale, GROUP=group, D=d, BLOCK_S=block_s, PADM=padm,
+        scale, GROUP=group, D=d, BLOCK_S=block_s, PADM=padm, R=r,
         num_warps=4,
     )
 
