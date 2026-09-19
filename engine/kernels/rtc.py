@@ -530,52 +530,51 @@ __device__ void gemv(const bf16* W, const bf16* X, bf16* O,
     }
 }
 
-// group-local gemv: one sequence's row, warps gwl..gwl+nwl cover outputs
+// group-local gemv: one sequence's row, warps gwl..gwl+nwl cover outputs.
+// 4 output rows per warp, 2-deep prefetch → 8 weight loads in flight.
 __device__ void gemv_g(const bf16* W, const bf16* xr, bf16* O,
                        int Od, int K, bf16* res, const bf16* gu,
                        int fused, int gw, int gwtot) {
     int lane = threadIdx.x & 31;
     int K8 = K / 8;
     if (!fused) {
-        for (int o0 = gw * 2; o0 < Od; o0 += gwtot * 2) {
-            int o1 = o0 + 1;
-            const bf16* wr0 = W + (long long)o0 * K;
-            const bf16* wr1 = o1 < Od ? W + (long long)o1 * K : wr0;
-            float acc0 = 0.f, acc1 = 0.f;
+        for (int o0 = gw * 4; o0 < Od; o0 += gwtot * 4) {
+            const bf16* wr[4];
+            float acc[4] = {0.f, 0.f, 0.f, 0.f};
+            for (int t = 0; t < 4; ++t) {
+                int o = o0 + t;
+                wr[t] = o < Od ? W + (long long)o * K : wr[0];
+            }
             int k8 = lane;
-            int4 w0 = {}, x0 = {}, w1 = {}, x1 = {};
+            int4 wv[4], xv[4];
             if (k8 < K8) {
-                w0 = *(const int4*)(wr0 + (long long)k8 * 8);
-                x0 = *(const int4*)(xr + (long long)k8 * 8);
-                w1 = *(const int4*)(wr1 + (long long)k8 * 8);
-                x1 = *(const int4*)(xr + (long long)k8 * 8);
+                for (int t = 0; t < 4; ++t) {
+                    wv[t] = *(const int4*)(wr[t] + (long long)k8 * 8);
+                    xv[t] = *(const int4*)(xr + (long long)k8 * 8);
+                }
             }
             for (; k8 < K8; k8 += 32) {
                 int k8n = k8 + 32;
-                int4 w0n = {}, x0n = {}, w1n = {}, x1n = {};
-                if (k8n < K8) {
-                    w0n = *(const int4*)(wr0 + (long long)k8n * 8);
-                    x0n = *(const int4*)(xr + (long long)k8n * 8);
-                    w1n = *(const int4*)(wr1 + (long long)k8n * 8);
-                    x1n = *(const int4*)(xr + (long long)k8n * 8);
-                }
-                acc0 += prod8(w0, x0); acc1 += prod8(w1, x1);
-                w0 = w0n; x0 = x0n; w1 = w1n; x1 = x1n;
+                int4 wn[4], xn[4];
+                if (k8n < K8)
+                    for (int t = 0; t < 4; ++t) {
+                        wn[t] = *(const int4*)(wr[t]
+                                               + (long long)k8n * 8);
+                        xn[t] = *(const int4*)(xr + (long long)k8n * 8);
+                    }
+                for (int t = 0; t < 4; ++t) acc[t] += prod8(wv[t], xv[t]);
+                for (int t = 0; t < 4; ++t) { wv[t] = wn[t]; xv[t] = xn[t]; }
             }
-            acc0 += __shfl_down_sync(0xffffffffu, acc0, 16);
-            acc0 += __shfl_down_sync(0xffffffffu, acc0, 8);
-            acc0 += __shfl_down_sync(0xffffffffu, acc0, 4);
-            acc0 += __shfl_down_sync(0xffffffffu, acc0, 2);
-            acc0 += __shfl_down_sync(0xffffffffu, acc0, 1);
-            acc1 += __shfl_down_sync(0xffffffffu, acc1, 16);
-            acc1 += __shfl_down_sync(0xffffffffu, acc1, 8);
-            acc1 += __shfl_down_sync(0xffffffffu, acc1, 4);
-            acc1 += __shfl_down_sync(0xffffffffu, acc1, 2);
-            acc1 += __shfl_down_sync(0xffffffffu, acc1, 1);
-            if (lane == 0) {
-                O[o0] = res ? bfadd(res[o0], f2bf(acc0)) : f2bf(acc0);
-                if (o1 < Od)
-                    O[o1] = res ? bfadd(res[o1], f2bf(acc1)) : f2bf(acc1);
+            for (int t = 0; t < 4; ++t) {
+                float a = acc[t];
+                a += __shfl_down_sync(0xffffffffu, a, 16);
+                a += __shfl_down_sync(0xffffffffu, a, 8);
+                a += __shfl_down_sync(0xffffffffu, a, 4);
+                a += __shfl_down_sync(0xffffffffu, a, 2);
+                a += __shfl_down_sync(0xffffffffu, a, 1);
+                int o = o0 + t;
+                if (lane == 0 && o < Od)
+                    O[o] = res ? bfadd(res[o], f2bf(a)) : f2bf(a);
             }
         }
         return;
@@ -610,49 +609,47 @@ __device__ void gemv_g(const bf16* W, const bf16* xr, bf16* O,
     }
 }
 
-// group-local lm head: float logits out for one sequence
+// group-local lm head: float logits out for one sequence.
+// x row shared across outputs — prefetch weights only, 4 rows/warp.
 __device__ void gemv_gf(const bf16* W, const bf16* xr, float* O,
                         int Od, int K, int gw, int gwtot) {
     int lane = threadIdx.x & 31;
     int K8 = K / 8;
-    for (int o0 = gw * 2; o0 < Od; o0 += gwtot * 2) {
-        int o1 = o0 + 1;
-        const bf16* wr0 = W + (long long)o0 * K;
-        const bf16* wr1 = o1 < Od ? W + (long long)o1 * K : wr0;
-        float acc0 = 0.f, acc1 = 0.f;
+    for (int o0 = gw * 4; o0 < Od; o0 += gwtot * 4) {
+        const bf16* wr[4];
+        float acc[4] = {0.f, 0.f, 0.f, 0.f};
+        for (int t = 0; t < 4; ++t) {
+            int o = o0 + t;
+            wr[t] = o < Od ? W + (long long)o * K : wr[0];
+        }
         int k8 = lane;
-        int4 w0 = {}, x0 = {}, w1 = {}, x1 = {};
+        int4 wv[4], xv = {};
         if (k8 < K8) {
-            w0 = *(const int4*)(wr0 + (long long)k8 * 8);
-            x0 = *(const int4*)(xr + (long long)k8 * 8);
-            w1 = *(const int4*)(wr1 + (long long)k8 * 8);
-            x1 = *(const int4*)(xr + (long long)k8 * 8);
+            xv = *(const int4*)(xr + (long long)k8 * 8);
+            for (int t = 0; t < 4; ++t)
+                wv[t] = *(const int4*)(wr[t] + (long long)k8 * 8);
         }
         for (; k8 < K8; k8 += 32) {
             int k8n = k8 + 32;
-            int4 w0n = {}, x0n = {}, w1n = {}, x1n = {};
+            int4 wn[4], xn = {};
             if (k8n < K8) {
-                w0n = *(const int4*)(wr0 + (long long)k8n * 8);
-                x0n = *(const int4*)(xr + (long long)k8n * 8);
-                w1n = *(const int4*)(wr1 + (long long)k8n * 8);
-                x1n = *(const int4*)(xr + (long long)k8n * 8);
+                xn = *(const int4*)(xr + (long long)k8n * 8);
+                for (int t = 0; t < 4; ++t)
+                    wn[t] = *(const int4*)(wr[t] + (long long)k8n * 8);
             }
-            acc0 += prod8(w0, x0); acc1 += prod8(w1, x1);
-            w0 = w0n; x0 = x0n; w1 = w1n; x1 = x1n;
+            for (int t = 0; t < 4; ++t) acc[t] += prod8(wv[t], xv);
+            for (int t = 0; t < 4; ++t) wv[t] = wn[t];
+            xv = xn;
         }
-        acc0 += __shfl_down_sync(0xffffffffu, acc0, 16);
-        acc0 += __shfl_down_sync(0xffffffffu, acc0, 8);
-        acc0 += __shfl_down_sync(0xffffffffu, acc0, 4);
-        acc0 += __shfl_down_sync(0xffffffffu, acc0, 2);
-        acc0 += __shfl_down_sync(0xffffffffu, acc0, 1);
-        acc1 += __shfl_down_sync(0xffffffffu, acc1, 16);
-        acc1 += __shfl_down_sync(0xffffffffu, acc1, 8);
-        acc1 += __shfl_down_sync(0xffffffffu, acc1, 4);
-        acc1 += __shfl_down_sync(0xffffffffu, acc1, 2);
-        acc1 += __shfl_down_sync(0xffffffffu, acc1, 1);
-        if (lane == 0) {
-            O[o0] = acc0;
-            if (o1 < Od) O[o1] = acc1;
+        for (int t = 0; t < 4; ++t) {
+            float a = acc[t];
+            a += __shfl_down_sync(0xffffffffu, a, 16);
+            a += __shfl_down_sync(0xffffffffu, a, 8);
+            a += __shfl_down_sync(0xffffffffu, a, 4);
+            a += __shfl_down_sync(0xffffffffu, a, 2);
+            a += __shfl_down_sync(0xffffffffu, a, 1);
+            int o = o0 + t;
+            if (lane == 0 && o < Od) O[o] = a;
         }
     }
 }
