@@ -624,13 +624,17 @@ class Engine:
         return g
 
     @staticmethod
-    def _drain(pin, sentinel=-1):
+    def _drain(pin, sentinel=-1, timeout=8.0):
         # Spin until a pending non_blocking D2H copy lands in `pin`.
         # cudaDeviceSynchronize costs ~ms under gVisor (trapped ioctl);
         # polling pinned host memory is a plain read. Fill with sentinel
-        # before enqueueing the copy.
+        # before enqueueing the copy. Bounded: if the copy never lands
+        # (dead context, unsupported pinned path) we must fail fast, not
+        # hang the whole run past the platform's wall budget.
+        t0 = time.perf_counter()
         while bool((pin == sentinel).any()):
-            pass
+            if time.perf_counter() - t0 > timeout:
+                raise RuntimeError("drain_timeout")
 
     def _bench(self, fn, iters: int = 3) -> float:
         """ms/call wall-clock for fn(), whatever it does internally."""
@@ -1217,6 +1221,16 @@ class Engine:
         st.spec_cooldown = 0
         st.ptog = 0
         st.ppending = []
+        # probe the pinned D2H path once per state: a sentinel-filled
+        # pinned buffer, one real copy, a bounded drain. If it doesn't
+        # land under gVisor we fall back to a plain synchronize.
+        try:
+            st.pin2[0].fill_(-1)
+            st.pin2[0].copy_(st.cur[:, 0], non_blocking=True)
+            self._drain(st.pin2[0], timeout=3.0)
+            st.pinned_ok = not bool((st.pin2[0] == -1).any())
+        except Exception:
+            st.pinned_ok = False
         if DIAG_BOOM and st.B == 1:
             # die on the first public workload with diagnostics packed into
             # the exception — the run reports caseMessage even when stdout
@@ -1271,7 +1285,7 @@ class Engine:
                 probes_mask |= 1 << i
         flags = ((1 if self._step_slow_only else 0)
                  | (2 if st.spec_enabled else 0)
-                 | (4 if getattr(self, "_jit_ok", False) else 0)
+                 | (4 if getattr(st, "pinned_ok", False) else 0)
                  | (8 if _HAS_TRITON else 0))
         dec = getattr(st, "decode_name", 0) & 15
         spc = getattr(st, "spec_name", 0) & 15
@@ -1459,16 +1473,24 @@ class Engine:
                     st.decode_runner()
                     st.t_run += time.perf_counter() - _t0
                     st.t_n += 1
-                    pi = st.ptog
-                    st.pin2[pi].fill_(-1)
-                    st.pin2[pi].copy_(st.cur[:, 0], non_blocking=True)
-                    st.ppending.append(pi)
-                    st.ptog ^= 1
-                    if len(st.ppending) > 1:
+                    if getattr(st, "pinned_ok", True):
+                        pi = st.ptog
+                        st.pin2[pi].fill_(-1)
+                        st.pin2[pi].copy_(st.cur[:, 0], non_blocking=True)
+                        st.ppending.append(pi)
+                        st.ptog ^= 1
+                        if len(st.ppending) > 1:
+                            _t0 = time.perf_counter()
+                            self._drain(st.pin2[st.ppending[0]])
+                            st.t_drain += time.perf_counter() - _t0
+                            toks = st.pin2[st.ppending.pop(0)].tolist()
+                            for b in range(B):
+                                queues[b].append(toks[b])
+                                hists[b].append(toks[b])
+                    else:
                         _t0 = time.perf_counter()
-                        self._drain(st.pin2[st.ppending[0]])
+                        toks = st.cur[:, 0].tolist()
                         st.t_drain += time.perf_counter() - _t0
-                        toks = st.pin2[st.ppending.pop(0)].tolist()
                         for b in range(B):
                             queues[b].append(toks[b])
                             hists[b].append(toks[b])
