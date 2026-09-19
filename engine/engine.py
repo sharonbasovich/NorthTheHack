@@ -1252,6 +1252,8 @@ class Engine:
                     runner = traced
                 if not ok:
                     continue
+                if name == "mega_all":
+                    self._mega_ms = -1
                 self._cand_mask |= 1 << {
                     "graph_slow": 0, "graph_fast": 1, "ext": 2,
                     "eager_fast": 3, "eager_rms": 4, "jit": 5,
@@ -1259,6 +1261,8 @@ class Engine:
                     "eager_rtc2": 9, "eager_sdpa": 10}.get(name, 11)
                 ms = self._bench(runner)
                 restore()
+                if name == "mega_all":
+                    self._mega_ms = ms
                 if name == "graph_slow" and not (ms < st.decode_ms):
                     self._gerr = 4
                 if ms < st.decode_ms:
@@ -1552,11 +1556,18 @@ class Engine:
                  | ((dec & 3) << 5))
         elif st.B == 16:
             n = max(st.t_n, 1)
-            run_ms = int(min(3, st.t_run / n * 1000))
             drain_ms = int(min(1, st.t_drain / n * 1000))
-            p = ((dec & 7)
-                 | ((getattr(self, "_rtc_adopted", 0) & 1) << 3)
-                 | (run_ms << 4) | (drain_ms << 6))
+            # 2b decode name, 1b mega adopted, 2b mega bench bucket
+            # (0<3ms,1:3-6,2:6-10,3:>10 / never ran), 1b drain, 1b rtc
+            mms = getattr(self, "_mega_ms", -1.0)
+            mcode = (0 if mms < 3 else 1 if mms < 6 else 2 if mms < 10
+                     else 3)
+            if mms < 0:
+                mcode = 3
+            p = ((dec & 3)
+                 | ((getattr(self, "_mega_adopted", 0) & 1) << 2)
+                 | (mcode << 3) | (drain_ms << 5)
+                 | ((getattr(self, "_rtc_adopted", 0) & 1) << 6))
         else:
             p = (dec & 7) | (emitenc << 3)
         # spike must exceed the workload's own peak (~16GB seen), so the
