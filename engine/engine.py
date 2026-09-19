@@ -962,10 +962,6 @@ class Engine:
         self._choose_path = 4
 
         candidates = []
-        # compile first: Inductor fuses the whole step into a handful of
-        # kernels — fewest CUDA calls, which is the gVisor bottleneck.
-        if self._probe("compile"):
-            candidates.append(("compile", "compile"))
         if self._probe("graph"):
             candidates.append(("graph_slow", self._decode_step_slow))
             if _HAS_TRITON and not self._step_slow_only:
@@ -1029,18 +1025,6 @@ class Engine:
                     ok = self._margin_ok(ref_logits, st.cur[:, 0], 1.9)
                     restore()
                     runner = traced
-                elif name == "compile":
-                    disarm = self._watchdog(100)
-                    try:
-                        _f = torch.compile(self._decode_step_slow_ret,
-                                           fullgraph=False)
-                        runner = lambda: _f(st)
-                        runner()
-                    finally:
-                        disarm()
-                    ok = self._margin_ok(ref_logits, st.cur[:, 0], 1.9)
-                    restore()
-                    runner = comp
                 if not ok:
                     continue
                 self._cand_mask |= 1 << {
