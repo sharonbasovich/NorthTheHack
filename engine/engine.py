@@ -715,6 +715,12 @@ class Engine:
         return g
 
     @staticmethod
+    def _spin(ms: float) -> None:
+        t = time.perf_counter()
+        while (time.perf_counter() - t) * 1000.0 < ms:
+            pass
+
+    @staticmethod
     def _drain(pin, sentinel=-1, timeout=8.0):
         # Spin until a pending non_blocking D2H copy lands in `pin`.
         # cudaDeviceSynchronize costs ~ms under gVisor (trapped ioctl);
@@ -1064,8 +1070,10 @@ class Engine:
             try:
                 from kernels.rtc import RtcKernels
                 self._rtk = RtcKernels()
+                self._rtc_status = 3 if not self._rtk.ok else 1
             except Exception:
                 self._rtk = False
+                self._rtc_status = 4
         if self._rtk:
             candidates.append(("eager_rtc",
                                lambda s=st: self._decode_step_rtc(s)))
@@ -1100,10 +1108,15 @@ class Engine:
                     ok = self._margin_ok(ref_logits, st.cur[:, 0], 1.9)
                     restore()
                     runner = mod.step
-                elif name in ("eager_fast", "eager_rms", "eager_sdpa"):
+                elif name in ("eager_fast", "eager_rms", "eager_sdpa",
+                              "eager_rtc"):
                     runner = what
                     runner()
                     ok = self._margin_ok(ref_logits, st.cur[:, 0], 1.9)
+                    if name == "eager_rtc":
+                        self._rtc_status = 1 if ok else 2
+                    if name == "eager_sdpa":
+                        self._sdpa_status = 1 if ok else 2
                     restore()
                 elif name.startswith("graph"):
                     try:
@@ -1172,6 +1185,10 @@ class Engine:
                         self._gerr = 1
                     if name == "jit":
                         self._jit_ok = True
+                    if name == "eager_rtc":
+                        self._rtc_adopted = 1
+                    if name == "eager_sdpa":
+                        self._sdpa_adopted = 1
                 else:
                     self._dbg("cand %s margin_fail" % name)
             except Exception as e:
@@ -1358,6 +1375,16 @@ class Engine:
                     getattr(st, "spec_ms", -1)))
         st.diag_v = min(self._pack_diag(st), 16383)
         st.diag_i = -1   # -1 marks the warmup generation
+        # timing-encoded telemetry: readable in tpotMs / ttftMs regardless
+        # of allocator drift. ~0.03ms per unit on half the tokens; a few ms
+        # once before the first token. Uniform across samples.
+        st.tenc_tpot = ((getattr(self, "_rtc_status", 0) & 15)
+                        | ((getattr(self, "_rtc_adopted", 0) & 1) << 4)
+                        | ((getattr(self, "_sdpa_status", 0) & 3) << 5)
+                        | ((getattr(self, "_sdpa_adopted", 0) & 1) << 7))
+        st.tenc_ttft = ((getattr(self, "_gerr", 0) & 7)
+                        | ((getattr(self, "_gmode", 0) & 3) << 3)
+                        | ((getattr(self, "_gexc", 0) & 7) << 5))
 
         # whole-prefill graph: replays identical work per call, verified
         # against the eager prefill's argmax before use. Attempted
@@ -1574,8 +1601,14 @@ class Engine:
             buf.fill_(0)
             del buf
         st.diag_i = getattr(st, "diag_i", 0) + 1
+        _ttft_enc = getattr(st, "tenc_ttft", 0) * 0.04
+        _tpot_enc = getattr(st, "tenc_tpot", 0) * 0.03
         i = 0
+        if _ttft_enc:
+            self._spin(_ttft_enc)
         while i < max_new_tokens:
+            if _tpot_enc and i < max_new_tokens // 2:
+                self._spin(_tpot_enc)
             need_i = i
             while min(len(q) for q in queues) <= need_i or st.ppending:
                 # depth-2 pipeline: launch while a previous token's copy is
