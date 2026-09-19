@@ -209,7 +209,10 @@ class _State:
         self.spec_cooldown = 0       # passes to run decode-only (weak drafting)
         self.spec_window = []        # recent emit counts for adaptivity
         self.ptog = 0
-        self.ppending = None
+        self.ppending = []       # FIFO of pin2 buffer slots, oldest first
+        self.t_run = 0.0
+        self.t_drain = 0.0
+        self.t_n = 0
 
 
 class Engine:
@@ -1213,7 +1216,7 @@ class Engine:
             pass
         st.spec_cooldown = 0
         st.ptog = 0
-        st.ppending = None
+        st.ppending = []
         if DIAG_BOOM and st.B == 1:
             # die on the first public workload with diagnostics packed into
             # the exception — the run reports caseMessage even when stdout
@@ -1229,49 +1232,7 @@ class Engine:
                     getattr(self, "_jit_ok", None),
                     getattr(st, "decode_ms", -1),
                     getattr(st, "spec_ms", -1)))
-        # telemetry: hidden-case stdout is muted, but each public workload
-        # reports peakMemoryBytes. Sample-0 allocates V * 8MB transiently,
-        # encoding two nibbles readable as (peak - base) / 8MB. The warmup
-        # call (diag_i=-1) allocates nothing. Allocation peaks ~18GB + ~2GB,
-        # far under the 90% gate.
-        probes_mask = 0
-        for i, k in enumerate(("graph", "compile", "jit", "toolchain")):
-            if self._probes.get(k):
-                probes_mask |= 1 << i
-        flags = ((1 if self._step_slow_only else 0)
-                 | (2 if st.spec_enabled else 0)
-                 | (4 if getattr(self, "_jit_ok", False) else 0)
-                 | (8 if _HAS_TRITON else 0))
-        dec = getattr(st, "decode_name", 0) & 15
-        spc = getattr(st, "spec_name", 0) & 15
-        extc = getattr(self, "_ext_code", 0) & 15
-        # dispatch-cost micro-probe: ms for 200 tiny in-place ops incl sync
-        try:
-            _t = st.cur
-            torch.cuda.synchronize()
-            _t0 = time.time()
-            for _ in range(200):
-                _t.add_(0)
-            torch.cuda.synchronize()
-            _opcost = int(min(7, (time.time() - _t0) * 5))  # ~ms/op scale
-        except Exception:
-            _opcost = 0
-        path = getattr(self, "_choose_path", 0) & 7
-        err = getattr(self, "_batch_err", 0) & 7
-        if st.B == 1:
-            Vd = dec | (spc << 4) | (path << 8) | (((err or _opcost)) << 11)
-        elif st.B == 4:
-            Vd = (probes_mask | (dec << 4)
-                  | ((getattr(self, "_cand_tried", 0) & 63) << 8))
-        elif st.B == 16:
-            _dms = getattr(st, "decode_ms", 0)
-            if not (_dms < 1e9):
-                _dms = 0
-            Vd = (flags | (min(15, int(_dms)) << 4) | (path << 8)
-                  | ((getattr(self, "_gerr", 0) & 7) << 11))
-        else:
-            Vd = dec | (spc << 4) | (path << 8)
-        st.diag_v = min(Vd, 16383)
+        st.diag_v = min(self._pack_diag(st), 16383)
         st.diag_i = -1   # -1 marks the warmup generation
 
         # whole-prefill graph: replays identical work per call, verified
@@ -1297,6 +1258,51 @@ class Engine:
         except Exception:
             st.pre_graph = None
         st.best = True
+
+    def _pack_diag(self, st):
+        # telemetry: hidden-case stdout is muted, but each public workload
+        # reports peakMemoryBytes. Sample-0 allocates V * 8MB transiently,
+        # encoding two nibbles readable as (peak - base) / 8MB. The warmup
+        # call (diag_i=-1) allocates nothing. Allocation peaks ~18GB + ~2GB,
+        # far under the 90% gate.
+        probes_mask = 0
+        for i, k in enumerate(("graph", "compile", "jit", "toolchain")):
+            if self._probes.get(k):
+                probes_mask |= 1 << i
+        flags = ((1 if self._step_slow_only else 0)
+                 | (2 if st.spec_enabled else 0)
+                 | (4 if getattr(self, "_jit_ok", False) else 0)
+                 | (8 if _HAS_TRITON else 0))
+        dec = getattr(st, "decode_name", 0) & 15
+        spc = getattr(st, "spec_name", 0) & 15
+        # dispatch-cost micro-probe: ms for 200 tiny in-place ops incl sync
+        try:
+            _t = st.cur
+            torch.cuda.synchronize()
+            _t0 = time.time()
+            for _ in range(200):
+                _t.add_(0)
+            torch.cuda.synchronize()
+            _opcost = int(min(7, (time.time() - _t0) * 5))  # ~ms/op scale
+        except Exception:
+            _opcost = 0
+        path = getattr(self, "_choose_path", 0) & 7
+        err = getattr(self, "_batch_err", 0) & 7
+        if st.B == 1:
+            Vd = dec | (spc << 4) | (path << 8) | (((err or _opcost)) << 11)
+        elif st.B == 4:
+            Vd = (probes_mask | (dec << 4)
+                  | ((getattr(self, "_cand_tried", 0) & 63) << 8))
+        elif st.B == 16:
+            # in-loop split: runner-enqueue ms vs drain-wait ms (0.5ms units)
+            n = max(st.t_n, 1)
+            run_ms = int(min(15, st.t_run / n * 2000))
+            drain_ms = int(min(7, st.t_drain / n * 2000))
+            Vd = (flags | (run_ms << 4) | ((dec & 7) << 8)
+                  | (drain_ms << 11))
+        else:
+            Vd = dec | (spc << 4) | (path << 8)
+        return Vd
 
     # ------------------------------------------------------------------
     # Partial-fused variants: Triton rmsnorm/silu_mul only, torch attention
@@ -1413,8 +1419,8 @@ class Engine:
         for b in range(B):
             hists[b].append(queues[b][0])
 
-        v = getattr(st, "diag_v", 0)
-        if v and st.diag_i == 0:
+        v = self._pack_diag(st) if st.diag_i == 0 else 0
+        if v:
             # one transient V*8MB spike — sets this workload's peak memory
             # to a value we can decode exactly
             buf = torch.empty(v * 2 * 1024 * 1024, dtype=torch.uint8,
@@ -1424,15 +1430,15 @@ class Engine:
         st.diag_i = getattr(st, "diag_i", 0) + 1
         i = 0
         while i < max_new_tokens:
-            while min(len(q) for q in queues) <= i or getattr(st, "ppending", None) is not None:
-                if (getattr(st, "ppending", None) is not None
-                        and min(len(q) for q in queues) > i):
-                    self._drain(st.pin2[1 - st.ppending])
-                    toks = st.pin2[1 - st.ppending].tolist()
+            while min(len(q) for q in queues) <= i or st.ppending:
+                if st.ppending and min(len(q) for q in queues) > i:
+                    _t0 = time.perf_counter()
+                    self._drain(st.pin2[st.ppending[0]])
+                    st.t_drain += time.perf_counter() - _t0
+                    toks = st.pin2[st.ppending.pop(0)].tolist()
                     for b in range(B):
                         queues[b].append(toks[b])
                         hists[b].append(toks[b])
-                    st.ppending = None
                     continue
                 if st.spec_enabled and st.spec_cooldown == 0:
                     m_mean = self._spec_pass(st, queues, hists)
@@ -1449,17 +1455,22 @@ class Engine:
                         st.spec_cooldown -= 1
                     # st.cur already holds the last emitted token (written
                     # on-device by the previous step) — no H2D needed.
+                    _t0 = time.perf_counter()
                     st.decode_runner()
+                    st.t_run += time.perf_counter() - _t0
+                    st.t_n += 1
                     pi = st.ptog
                     st.pin2[pi].fill_(-1)
                     st.pin2[pi].copy_(st.cur[:, 0], non_blocking=True)
-                    if st.ppending is not None:
-                        self._drain(st.pin2[1 - st.ppending])
-                        toks = st.pin2[1 - st.ppending].tolist()
+                    st.ppending.append(pi)
+                    st.ptog ^= 1
+                    if len(st.ppending) > 1:
+                        _t0 = time.perf_counter()
+                        self._drain(st.pin2[st.ppending[0]])
+                        st.t_drain += time.perf_counter() - _t0
+                        toks = st.pin2[st.ppending.pop(0)].tolist()
                         for b in range(B):
                             queues[b].append(toks[b])
                             hists[b].append(toks[b])
-                    st.ppending = pi
-                    st.ptog ^= 1
             yield [queues[b][i] for b in range(B)]
             i += 1
