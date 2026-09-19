@@ -710,7 +710,9 @@ class Engine:
             candidates.append(("graph_slow", self._decode_step_slow))
             if _HAS_TRITON and not self._step_slow_only:
                 candidates.append(("graph_fast", self._decode_step_fast))
-        if self._probe("jit"):
+        # jit only as a fallback: tracing ~1300 ops costs ~10-60s per call,
+        # so skip it entirely when the C++ ext loaded (it strictly dominates).
+        if self._ext is None and self._probe("jit"):
             candidates.append(("jit", "jit"))
 
         for name, what in candidates:
@@ -762,6 +764,8 @@ class Engine:
                         "eager_fast": 1, "graph_slow": 2, "graph_fast": 3,
                         "jit": 4, "compile": 5, "ext": 6, "eager_rms": 7,
                     }[name]
+                    if name == "jit":
+                        self._jit_ok = True
             except Exception:
                 restore()
 
@@ -800,7 +804,9 @@ class Engine:
                             continue
                         runner = self._ext.step_batch
                     elif make == "jit":
-                        if not self._probe("jit"):
+                        # only if jit decode actually got adopted — batch
+                        # tracing is ~1400 ops and not worth it otherwise
+                        if not getattr(self, "_jit_ok", False):
                             continue
                         runner = torch.jit.trace(
                             lambda: self._decode_step_slow_batch(st), ())
