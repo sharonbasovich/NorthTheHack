@@ -1045,12 +1045,42 @@ class Engine:
             # the torch batch verify reuses exactly the same ops as the slow
             # step (verified locally); adopt unconditionally — emit/matched
             # semantics make every emitted token a true model argmax.
-            st.spec_runner = lambda: self._decode_step_slow_batch(st)
-            st.spec_ms = self._bench(st.spec_runner)
-            self._batch_err = 3
-            st.spec_name = 1
+            # real-data numeric gate: replay the verify pass's own emitted
+            # tokens through the single-token slow step; every emitted token
+            # must sit within 0.75 logits of the slow step's argmax (the
+            # batch path's numerics vs the trusted torch step).
+            self._batch_err = 4
+            am_b = st.emit_dev[:, :R].clone()
+            ok = True
+            valid = torch.ones(st.B, dtype=torch.bool, device=self.dev)
+            st.cur[:, 0] = c0[:, 0]
+            st.pos.copy_(p0)
+            for j in range(R):
+                if not bool(valid.any()):
+                    break
+                self._decode_step_slow(st)
+                sl = self._last_logits
+                within = (sl.gather(1, am_b[:, j:j + 1]).squeeze(1)
+                          >= sl.max(dim=1).values - 0.75)
+                if not bool(within[valid].all()):
+                    ok = False
+                    break
+                st.cur[:, 0] = am_b[:, j]
+                if j + 1 < R:
+                    valid &= (st.inp[:, j + 1] == am_b[:, j])
+            self._batch_err = 5
             restore()
-            self._batch_err = 0
+            if not ok:
+                st.spec_runner = None
+                # keep err=5: batch logits diverged from the slow step on
+                # real tokens — visible in the telemetry nibble
+            else:
+                st.spec_runner = lambda: self._decode_step_slow_batch(st)
+                st.spec_ms = self._bench(st.spec_runner)
+                self._batch_err = 3
+                st.spec_name = 1
+                restore()
+                self._batch_err = 0
         except Exception as exc:
             self._batch_exc = type(exc).__name__[:10]
             restore()
