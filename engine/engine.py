@@ -160,7 +160,7 @@ class _State:
         self.jj = torch.arange(NKV, device=dev).view(1, NKV).expand(batch, NKV)
         self.iB = torch.arange(batch, device=dev)
         positions = torch.arange(capacity, device=dev, dtype=torch.float32)
-        inv = engine.model.model.rotary_emb.inv_freq.float().to(dev)
+        inv = engine.rope_inv_freq.float().to(dev)
         freqs = torch.outer(positions, inv)
         emb = torch.cat((freqs, freqs), dim=-1)
         self.cos = emb.cos().to(torch.bfloat16)
@@ -199,50 +199,117 @@ class _State:
 
 
 class Engine:
+    def _direct_load(self, model_path: str):
+        """Load weights straight from safetensors — skips the Transformers
+        reader entirely (~10-20s vs 60-90s per fresh workload process)."""
+        import glob as _glob
+        import json as _json
+        from safetensors import safe_open
+        cfg = _json.load(open(os.path.join(model_path, "config.json")))
+        self.rope_theta = float(cfg.get("rope_theta", 5000000.0))
+        need = {"model.embed_tokens.weight", "model.norm.weight"}
+        for i in range(NL):
+            p = "model.layers.%d." % i
+            for s in ("self_attn.q_proj", "self_attn.k_proj",
+                      "self_attn.v_proj", "self_attn.o_proj",
+                      "self_attn.q_norm", "self_attn.k_norm",
+                      "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj",
+                      "input_layernorm", "post_attention_layernorm"):
+                need.add(p + s + ".weight")
+        got = {}
+        for sh in sorted(_glob.glob(os.path.join(model_path, "*.safetensors"))):
+            with safe_open(sh, framework="pt", device="cpu") as f:
+                for k in f.keys():
+                    if k in need or k == "lm_head.weight":
+                        got[k] = f.get_tensor(k).to(self.dev,
+                                                    non_blocking=True)
+        if len(got) < len(need):
+            raise RuntimeError("missing tensors")
+        torch.cuda.synchronize()
+        return got
+
     def __init__(self, model_path: str) -> None:
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         self.dev = "cuda:0"
-        self.model = (
-            AutoModelForCausalLM.from_pretrained(
-                model_path,
-                torch_dtype=torch.bfloat16,
-                attn_implementation="sdpa",
-                local_files_only=True,
+        self.rope_theta = 5000000.0
+        self.model = None
+        try:
+            got = self._direct_load(model_path)
+            self.embed_w = got["model.embed_tokens.weight"]
+            # tied head: the checkpoint may not store lm_head.weight
+            self.lm_w = got.get("lm_head.weight", self.embed_w)
+            self.fin_w = got["model.norm.weight"]
+            self.layers = []
+            for i in range(NL):
+                p = "model.layers.%d." % i
+                qn = got[p + "self_attn.q_norm.weight"]
+                kn = got[p + "self_attn.k_norm.weight"]
+                self.layers.append({
+                    "wqkv": torch.cat([
+                        got[p + "self_attn.q_proj.weight"],
+                        got[p + "self_attn.k_proj.weight"],
+                        got[p + "self_attn.v_proj.weight"]],
+                        dim=0).contiguous(),
+                    "wo": got[p + "self_attn.o_proj.weight"],
+                    "wgu": torch.cat([
+                        got[p + "mlp.gate_proj.weight"],
+                        got[p + "mlp.up_proj.weight"]],
+                        dim=0).contiguous(),
+                    "wd": got[p + "mlp.down_proj.weight"],
+                    "ln_in": got[p + "input_layernorm.weight"],
+                    "ln_post": got[p + "post_attention_layernorm.weight"],
+                    "qn": qn,
+                    "kn": kn,
+                    "qkn": torch.cat([
+                        qn.unsqueeze(0).expand(NQ, D),
+                        kn.unsqueeze(0).expand(NKV, D)]).contiguous(),
+                })
+        except Exception:
+            self.model = (
+                AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    torch_dtype=torch.bfloat16,
+                    attn_implementation="sdpa",
+                    local_files_only=True,
+                )
+                .eval()
+                .to(self.dev)
             )
-            .eval()
-            .to(self.dev)
-        )
-        base = self.model.model
-        self.embed_w = base.embed_tokens.weight
-        self.lm_w = self.model.lm_head.weight
-        self.fin_w = base.norm.weight
+            base = self.model.model
+            self.embed_w = base.embed_tokens.weight
+            self.lm_w = self.model.lm_head.weight
+            self.fin_w = base.norm.weight
+            self.rope_theta = float(
+                getattr(self.model.config, "rope_theta", 5000000.0))
+            self.layers = []
+            for layer in base.layers:
+                a = layer.self_attn
+                self.layers.append(
+                    {
+                        "wqkv": torch.cat(
+                            [a.q_proj.weight, a.k_proj.weight, a.v_proj.weight], dim=0
+                        ).contiguous(),
+                        "wo": a.o_proj.weight,
+                        "wgu": torch.cat(
+                            [layer.mlp.gate_proj.weight, layer.mlp.up_proj.weight], dim=0
+                        ).contiguous(),
+                        "wd": layer.mlp.down_proj.weight,
+                        "ln_in": layer.input_layernorm.weight,
+                        "ln_post": layer.post_attention_layernorm.weight,
+                        "qn": a.q_norm.weight,
+                        "kn": a.k_norm.weight,
+                        "qkn": torch.cat(
+                            [
+                                a.q_norm.weight.unsqueeze(0).expand(NQ, D),
+                                a.k_norm.weight.unsqueeze(0).expand(NKV, D),
+                            ]
+                        ).contiguous(),
+                    }
+                )
+        self.rope_inv_freq = 1.0 / (
+            self.rope_theta ** (torch.arange(0, D, 2).float() / D))
         self._step_slow_only = False
-        self.layers = []
-        for layer in base.layers:
-            a = layer.self_attn
-            self.layers.append(
-                {
-                    "wqkv": torch.cat(
-                        [a.q_proj.weight, a.k_proj.weight, a.v_proj.weight], dim=0
-                    ).contiguous(),
-                    "wo": a.o_proj.weight,
-                    "wgu": torch.cat(
-                        [layer.mlp.gate_proj.weight, layer.mlp.up_proj.weight], dim=0
-                    ).contiguous(),
-                    "wd": layer.mlp.down_proj.weight,
-                    "ln_in": layer.input_layernorm.weight,
-                    "ln_post": layer.post_attention_layernorm.weight,
-                    "qn": a.q_norm.weight,
-                    "kn": a.k_norm.weight,
-                    "qkn": torch.cat(
-                        [
-                            a.q_norm.weight.unsqueeze(0).expand(NQ, D),
-                            a.k_norm.weight.unsqueeze(0).expand(NKV, D),
-                        ]
-                    ).contiguous(),
-                }
-            )
         self.states = {}
         self._probes = {}
         self._ext = None       # compiled C++ decode-step module
@@ -415,7 +482,41 @@ class Engine:
         """Native-layer prefill writing into the static cache. Returns [B]."""
         return self._prefill_core(st, ids).clone()
 
+    def _prefill_manual(self, st: _State, ids: torch.Tensor) -> torch.Tensor:
+        """HF-free prefill: same math as the pinned sdpa path — bf16 matmuls,
+        fp32 RMSNorm with the same cast placement, flash attention via
+        scaled_dot_product_attention (GQA native), fp32 softmax internally."""
+        B, L = ids.shape
+        pos = torch.arange(L, device=self.dev)
+        x = F.embedding(ids, self.embed_w)
+        cos = st.cos.index_select(0, pos).view(1, L, 1, D)
+        sin = st.sin.index_select(0, pos).view(1, L, 1, D)
+        for i, w in enumerate(self.layers):
+            h = _rms(x, w["ln_in"])
+            qkv = h @ w["wqkv"].t()
+            qk = qkv[..., : (NQ + NKV) * D].view(B, L, NQ + NKV, D)
+            v = qkv[..., (NQ + NKV) * D :].view(B, L, NKV, D)
+            qkn = _rms(qk, w["qkn"])
+            qke = qkn * cos + _rot_half(qkn) * sin
+            qe = qke[..., :NQ, :].transpose(1, 2)          # [B,NQ,L,D]
+            ke = qke[..., NQ:, :].transpose(1, 2)         # [B,NKV,L,D]
+            st.kc[i][:, :, :L].copy_(ke)
+            st.vc[i][:, :, :L].copy_(v.transpose(1, 2))
+            attn = F.scaled_dot_product_attention(
+                qe, st.kc[i][:, :, :L], st.vc[i][:, :, :L],
+                is_causal=True, enable_gqa=True)
+            o = attn.transpose(1, 2).reshape(B, L, NQ * D)
+            x = x + o @ w["wo"].t()
+            h2 = _rms(x, w["ln_post"])
+            gu = h2 @ w["wgu"].t()
+            x = x + (F.silu(gu[..., :I]) * gu[..., I:]) @ w["wd"].t()
+        x = _rms(x, self.fin_w)
+        logits = x[:, -1, :] @ self.lm_w.t()
+        return logits.argmax(dim=-1)
+
     def _prefill_core(self, st: _State, ids: torch.Tensor) -> torch.Tensor:
+        if self.model is None:
+            return self._prefill_manual(st, ids)
         base = self.model.model
         length = ids.shape[1]
         position_ids = torch.arange(length, device=self.dev).unsqueeze(0)
