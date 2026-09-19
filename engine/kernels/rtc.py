@@ -356,6 +356,10 @@ extern "C" __global__ void silu_k(const bf16* __restrict__ gu,
 # co-resident: launched with nblk = SM count, 256 threads, modest smem —
 # guaranteed at least one resident block per SM on any modern part.
 MEGA_SRC = BF16_HELPERS + r"""
+#ifdef COOP
+extern "C" __device__ unsigned cudaCGGetIntrinsicHandle(unsigned long long*);
+extern "C" __device__ void cudaCGSynchronizeGrid(unsigned long long);
+#endif
 #define NT 512
 #define HDIM 2560
 #define VDIM 151936
@@ -364,6 +368,13 @@ MEGA_SRC = BF16_HELPERS + r"""
 #define ODIM 4096
 #define GDIM 19456
 
+#ifdef COOP
+__device__ __forceinline__ void gbar(unsigned* cnt, volatile unsigned* gen) {
+    unsigned long long h;
+    cudaCGGetIntrinsicHandle(&h);
+    cudaCGSynchronizeGrid(h);
+}
+#else
 __device__ __forceinline__ void gbar(unsigned* cnt, volatile unsigned* gen) {
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -378,6 +389,7 @@ __device__ __forceinline__ void gbar(unsigned* cnt, volatile unsigned* gen) {
     }
     __syncthreads();
 }
+#endif
 
 __device__ __forceinline__ float prod8(const int4 wv, const int4 xv) {
     const unsigned* wu = (const unsigned*)&wv;
@@ -891,10 +903,17 @@ class Rtc:
             raise RuntimeError(f"cuModuleGetFunction rc={rc}")
         return fn
 
-    def launch(self, fn, grid, block, smem, args):
+    def launch(self, fn, grid, block, smem, args, coop=False):
         arr = (ctypes.c_void_p * len(args))(
             *[ctypes.addressof(a) for a in args])
         stream = torch.cuda.current_stream().cuda_stream
+        if coop:
+            rc = self.cuda.cuLaunchCooperativeKernel(
+                fn, grid, 1, 1, block, 1, 1, smem,
+                ctypes.c_void_p(stream), arr)
+            if rc:
+                raise RuntimeError(f"cuLaunchCooperativeKernel rc={rc}")
+            return
         rc = self.cuda.cuLaunchKernel(
             fn, grid, 1, 1, block, 1, 1, smem,
             ctypes.c_void_p(stream), arr, None)
@@ -934,6 +953,14 @@ class RtcKernels:
                                        "attn_mega_k")
             self.megafn = self.rtc.compile(MEGA_SRC, "stepall",
                                            "step_all_k")
+            # cooperative variant: hardware grid.sync() barriers
+            self.megacoop = None
+            try:
+                self.megacoop = self.rtc.compile(
+                    "#define COOP 1\n" + MEGA_SRC, "stepallc",
+                    "step_all_k")
+            except Exception:
+                pass
             self.nblk = torch.cuda.get_device_properties(
                 0).multi_processor_count
 
@@ -990,6 +1017,23 @@ class RtcKernels:
                  qkv, obuf, gu, logits, amaxv, amaxi, cnt, gen,
                  flag_dev, tokm_dev, B, NL, ntok, eps, cap, bench=0):
         smem = (cap + 8) * 6 + 512
+        if self.megacoop is not None:
+            try:
+                self.rtc.launch(self.megacoop, self.nblk, 512, smem,
+                                [ptr(lw), ptr(embed), ptr(finw), ptr(cost),
+                                 ptr(sint), ptr(pos), ptr(cur), ptr(hid),
+                                 ptr(hbuf), ptr(qkv), ptr(obuf), ptr(gu),
+                                 ptr(logits), ptr(amaxv), ptr(amaxi),
+                                 ptr(cnt), ptr(gen),
+                                 ctypes.c_void_p(flag_dev),
+                                 ctypes.c_void_p(tokm_dev),
+                                 i32(B), i32(NL), i32(ntok), f32(eps),
+                                 i64(cap), i32(bench)], coop=True)
+                self.coop_ok = True
+                return
+            except Exception:
+                self.coop_ok = False
+                self.megacoop = None
         self.rtc.launch(self.megafn, self.nblk, 512, smem,
                         [ptr(lw), ptr(embed), ptr(finw), ptr(cost),
                          ptr(sint), ptr(pos), ptr(cur), ptr(hid),
