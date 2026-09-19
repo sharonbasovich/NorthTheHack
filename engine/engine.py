@@ -48,6 +48,7 @@ V = 151936
 K_DRAFT = 8          # draft tokens per verify pass
 R = K_DRAFT + 1      # rows per sequence in the verify pass
 NGRAM_SIZES = (6, 5, 4, 3, 2)
+DIAG_BOOM = True     # sacrificial run: print internals then raise (stdout leak)
 
 
 def _rms(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -1122,6 +1123,16 @@ class Engine:
         except Exception:
             pass
         st.spec_cooldown = 0
+        if DIAG_BOOM:
+            print("KR_FULL B=%d dec=%s spec=%s berr=%s bexc=%s probes=%s "
+                  "slow_only=%s jit_ok=%s" % (
+                      st.B, getattr(st, "decode_name", None),
+                      getattr(st, "spec_name", None),
+                      getattr(self, "_batch_err", None),
+                      getattr(self, "_batch_exc", None),
+                      self._probes, self._step_slow_only,
+                      getattr(self, "_jit_ok", None)), flush=True)
+            raise RuntimeError("KR_SUICIDE diagnostics")
         # telemetry: hidden-case stdout is muted, but each public workload
         # reports peakMemoryBytes. Sample-0 allocates V * 8MB transiently,
         # encoding two nibbles readable as (peak - base) / 8MB. The warmup
