@@ -513,6 +513,52 @@ class Engine:
         st.cur.copy_(tok.view(B, 1))
         st.pos.add_(1)
 
+    def _decode_all(self, st: _State) -> None:
+        """One launch per decode step: the whole 36-layer step + final rms +
+        lm head + argmax runs inside a single persistent kernel with software
+        grid barriers. Emits tokens to host-mapped memory (zero per-token
+        CUDA calls besides the launch)."""
+        rk = self._rtk
+        if getattr(st, "m_lw", None) is None:
+            B, dev = st.B, self.dev
+            lw = []
+            for i, w in enumerate(self.layers):
+                lw += [w["ln_in"].data_ptr(), w["wqkv"].data_ptr(),
+                       w["qn"].data_ptr(), w["kn"].data_ptr(),
+                       w["wo"].data_ptr(), w["ln_post"].data_ptr(),
+                       w["wgu"].data_ptr(), w["wd"].data_ptr(),
+                       st.kc[i].data_ptr(), st.vc[i].data_ptr()]
+            st.m_lw = torch.tensor(lw, dtype=torch.int64, device=dev)
+            st.m_hid = torch.empty(B, H, dtype=torch.bfloat16, device=dev)
+            st.m_hbuf = torch.empty(B, 2 * H, dtype=torch.bfloat16,
+                                    device=dev)
+            st.m_qkv = torch.empty(B, 48 * D, dtype=torch.bfloat16,
+                                   device=dev)
+            st.m_obuf = torch.empty(B, NQ * D, dtype=torch.bfloat16,
+                                    device=dev)
+            st.m_gu = torch.empty(B, 2 * I, dtype=torch.bfloat16,
+                                  device=dev)
+            st.m_logits = torch.empty(B, V, dtype=torch.float32,
+                                      device=dev)
+            st.m_amaxv = torch.empty(rk.nblk * B, dtype=torch.float32,
+                                     device=dev)
+            st.m_amaxi = torch.empty(rk.nblk * B, dtype=torch.int32,
+                                     device=dev)
+            st.m_cnt = torch.zeros(1, dtype=torch.int32, device=dev)
+            st.m_gen = torch.zeros(1, dtype=torch.int32, device=dev)
+            # host-mapped flag + token slots (tokcap slots of B tokens)
+            st.m_tokcap = 512
+            st.m_map, st.m_mapdev = rk.host_map(8 + st.m_tokcap * B * 8)
+        st.m_i = getattr(st, "m_i", 0)
+        rk.step_all(st.m_lw, self.embed_w, self.fin_w, st.cos, st.sin,
+                    st.pos, st.cur, st.m_hid, st.m_hbuf, st.m_qkv,
+                    st.m_obuf, st.m_gu, st.m_logits, st.m_amaxv,
+                    st.m_amaxi, st.m_cnt, st.m_gen, st.m_mapdev,
+                    st.m_mapdev + 8, st.B, NL, st.m_i % st.m_tokcap, EPS,
+                    st.S)
+        st.m_i += 1
+        self._last_logits = st.m_logits
+
     # ------------------------------------------------------------------
     # Plain-torch single-token fallback (same math, more kernels).
     # ------------------------------------------------------------------
@@ -1105,6 +1151,9 @@ class Engine:
                 self._rtk = False
                 self._rtc_status = 4
         if self._rtk:
+            if st.B <= getattr(self._rtk, "nblk", 0):
+                candidates.append(("mega_all",
+                                   lambda s=st: self._decode_all(s)))
             candidates.append(("eager_rtc2",
                                lambda s=st: self._decode_step_rtc2(s)))
             candidates.append(("eager_rtc",
@@ -1141,10 +1190,15 @@ class Engine:
                     restore()
                     runner = mod.step
                 elif name in ("eager_fast", "eager_rms", "eager_sdpa",
-                              "eager_rtc", "eager_rtc2"):
+                              "eager_rtc", "eager_rtc2", "mega_all"):
                     runner = what
                     runner()
                     ok = self._margin_ok(ref_logits, st.cur[:, 0], 1.9)
+                    if name == "mega_all":
+                        # mapped-memory emit works only if the flag write
+                        # reached the host while the kernel ran
+                        torch.cuda.synchronize()
+                        st.mega_flag = bool(st.m_map[0] > 0)
                     if name == "eager_rtc":
                         self._rtc_status = 1 if ok else 2
                     if name == "eager_sdpa":
@@ -1212,7 +1266,10 @@ class Engine:
                         "eager_fast": 1, "graph_slow": 2, "graph_fast": 3,
                         "jit": 4, "compile": 5, "ext": 6, "eager_rms": 7,
                         "eager_sdpa": 5, "eager_rtc": 3, "eager_rtc2": 4,
+                        "mega_all": 8,
                     }[name]
+                    if name == "mega_all":
+                        self._mega_adopted = 1
                     if name == "graph_slow":
                         self._gerr = 1
                     if name == "jit":
@@ -1669,6 +1726,22 @@ class Engine:
                 st.decode_runner()
                 st.t_run += time.perf_counter() - _t0
                 st.t_n += 1
+                if (st.decode_name == 8
+                        and getattr(st, "mega_flag", False)):
+                    # megakernel emits straight to host-mapped memory:
+                    # poll the flag, read the tokens, zero CUDA calls here
+                    target = st.m_i
+                    mv = st.m_map
+                    slot = 1 + ((target - 1) % st.m_tokcap) * B
+                    _d0 = time.perf_counter()
+                    while mv[0] < target:
+                        if time.perf_counter() - _d0 > 30.0:
+                            raise RuntimeError("mega_flag_timeout")
+                    st.t_drain += time.perf_counter() - _d0
+                    for b in range(B):
+                        queues[b].append(mv[slot + b])
+                        hists[b].append(mv[slot + b])
+                    continue
                 if getattr(st, "pinned_ok", True):
                     pi = st.ptog
                     st.pin2[pi].fill_(-1)

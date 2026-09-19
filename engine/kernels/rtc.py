@@ -351,6 +351,358 @@ extern "C" __global__ void silu_k(const bf16* __restrict__ gu,
 }
 """
 
+# Whole-step persistent kernel: one launch per decode step executes all 36
+# layers with software grid barriers between stages. Grid must be fully
+# co-resident: launched with nblk = SM count, 256 threads, modest smem —
+# guaranteed at least one resident block per SM on any modern part.
+MEGA_SRC = BF16_HELPERS + r"""
+#define NT 256
+#define HDIM 2560
+#define VDIM 151936
+#define IDIM 9728
+#define QKVD 4608
+#define ODIM 4096
+#define GDIM 19456
+
+__device__ __forceinline__ void gbar(unsigned* cnt, volatile unsigned* gen) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned g = *gen;
+        if (atomicAdd(cnt, 1u) == gridDim.x - 1) {
+            *cnt = 0;
+            __threadfence();
+            atomicExch((unsigned*)gen, g + 1);
+        } else {
+            while (*gen == g) { }
+        }
+    }
+    __syncthreads();
+}
+
+// one block reduces one row: bf16 x in, rms -> bf16 out (w bf16-mul)
+__device__ void rms_row(const bf16* x, const bf16* w, bf16* o,
+                        float eps, float* red) {
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < HDIM; i += NT) {
+        float v = bf2f(x[i]);
+        acc += v * v;
+    }
+    acc += __shfl_down_sync(0xffffffffu, acc, 16);
+    acc += __shfl_down_sync(0xffffffffu, acc, 8);
+    acc += __shfl_down_sync(0xffffffffu, acc, 4);
+    acc += __shfl_down_sync(0xffffffffu, acc, 2);
+    acc += __shfl_down_sync(0xffffffffu, acc, 1);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = acc;
+    __syncthreads();
+    float tot = 0.f;
+    for (int i = 0; i < NT / 32; ++i) tot += red[i];
+    float r = rsqrtf(tot / (float)HDIM + eps);
+    __syncthreads();
+    for (int i = threadIdx.x; i < HDIM; i += NT)
+        o[i] = bfmul(w[i], f2bf(bf2f(x[i]) * r));
+}
+
+// warp-per-output gemv over all rows: O[b,i] = sum_k W[i,k] * X[b,k]
+// optional bf16 residual add into O, optional fused silu reading GU.
+__device__ void gemv(const bf16* W, const bf16* X, bf16* O,
+                     int B, int Od, int K, bf16* res,
+                     const bf16* gu, int fused) {
+    int gw = blockIdx.x * (NT / 32) + (threadIdx.x >> 5);
+    int nw = gridDim.x * (NT / 32);
+    int lane = threadIdx.x & 31;
+    int nout = B * Od;
+    for (int o = gw; o < nout; o += nw) {
+        int b = o / Od, i = o % Od;
+        const bf16* xr = fused ? (gu + (long long)b * 2 * K)
+                               : (X + (long long)b * K);
+        const bf16* wr = W + (long long)i * K;
+        float acc = 0.f;
+        for (int k = lane; k < K; k += 32) {
+            bf16 xv;
+            if (fused) {
+                float a = bf2f(xr[k]);
+                float g = bf2f(xr[K + k]);
+                xv = bfmul(f2bf(a / (1.f + expf(-a))), f2bf(g));
+            } else {
+                xv = xr[k];
+            }
+            acc += bf2f(wr[k]) * bf2f(xv);
+        }
+        acc += __shfl_down_sync(0xffffffffu, acc, 16);
+        acc += __shfl_down_sync(0xffffffffu, acc, 8);
+        acc += __shfl_down_sync(0xffffffffu, acc, 4);
+        acc += __shfl_down_sync(0xffffffffu, acc, 2);
+        acc += __shfl_down_sync(0xffffffffu, acc, 1);
+        if (lane == 0) {
+            if (res) O[o] = bfadd(res[o], f2bf(acc));
+            else O[o] = f2bf(acc);
+        }
+    }
+}
+
+// float-output variant for the lm head
+__device__ void gemv_f(const bf16* W, const bf16* X, float* O,
+                       int B, int Od, int K) {
+    int gw = blockIdx.x * (NT / 32) + (threadIdx.x >> 5);
+    int nw = gridDim.x * (NT / 32);
+    int lane = threadIdx.x & 31;
+    for (int o = gw; o < B * Od; o += nw) {
+        int b = o / Od, i = o % Od;
+        const bf16* xr = X + (long long)b * K;
+        const bf16* wr = W + (long long)i * K;
+        float acc = 0.f;
+        for (int k = lane; k < K; k += 32)
+            acc += bf2f(wr[k]) * bf2f(xr[k]);
+        acc += __shfl_down_sync(0xffffffffu, acc, 16);
+        acc += __shfl_down_sync(0xffffffffu, acc, 8);
+        acc += __shfl_down_sync(0xffffffffu, acc, 4);
+        acc += __shfl_down_sync(0xffffffffu, acc, 2);
+        acc += __shfl_down_sync(0xffffffffu, acc, 1);
+        if (lane == 0) O[o] = acc;
+    }
+}
+
+// rope+cache+attention for one (b,j) pair; executed by threads 0..127 of
+// a block (warps 0-3). scores smem buffer provided by caller.
+__device__ void attn_unit(int b, int j, const bf16* row,
+                          const bf16* qn, const bf16* kn,
+                          const bf16* cost, const bf16* sint,
+                          bf16* kc, bf16* vc, long long p,
+                          bf16* out, long long cap,
+                          float scale, float eps,
+                          float* red, bf16* srope, float* scores) {
+    int d = threadIdx.x;   // < 128 guaranteed by caller guard
+    if (d >= 128) return;
+    const bf16* cosb = cost + p * 128;
+    const bf16* sinb = sint + p * 128;
+    // write k/v cache entries
+    {
+        const bf16* vsrc = row + (40 + j) * 128;
+        long long idx = ((long long)b * 8 + j) * cap + p;
+        vc[idx * 128 + d] = vsrc[d];
+        const bf16* ksrc = row + (32 + j) * 128;
+        float xv = bf2f(ksrc[d]);
+        float acc = xv * xv;
+        acc += __shfl_down_sync(0xffffffffu, acc, 16);
+        acc += __shfl_down_sync(0xffffffffu, acc, 8);
+        acc += __shfl_down_sync(0xffffffffu, acc, 4);
+        acc += __shfl_down_sync(0xffffffffu, acc, 2);
+        acc += __shfl_down_sync(0xffffffffu, acc, 1);
+        if ((d & 31) == 0) red[d >> 5] = acc;
+        __syncthreads();
+        float tot = red[0] + red[1] + red[2] + red[3];
+        float r = rsqrtf(tot / 128.f + eps);
+        bf16 t = bfmul(kn[d], f2bf(xv * r));
+        srope[d] = t;
+        __syncthreads();
+        bf16 rot = (d < 64) ? bfneg(srope[d + 64]) : srope[d - 64];
+        kc[idx * 128 + d] = bfadd(bfmul(t, cosb[d]),
+                                  bfmul(rot, sinb[d]));
+    }
+    __syncthreads();
+    const bf16* kbase = kc + ((long long)b * 8 + j) * cap * 128;
+    const bf16* vbase = vc + ((long long)b * 8 + j) * cap * 128;
+    for (int g = 0; g < 4; ++g) {
+        int h = j * 4 + g;
+        const bf16* qsrc = row + h * 128;
+        float xv = bf2f(qsrc[d]);
+        float acc = xv * xv;
+        acc += __shfl_down_sync(0xffffffffu, acc, 16);
+        acc += __shfl_down_sync(0xffffffffu, acc, 8);
+        acc += __shfl_down_sync(0xffffffffu, acc, 4);
+        acc += __shfl_down_sync(0xffffffffu, acc, 2);
+        acc += __shfl_down_sync(0xffffffffu, acc, 1);
+        if ((d & 31) == 0) red[d >> 5] = acc;
+        __syncthreads();
+        float tot = red[0] + red[1] + red[2] + red[3];
+        float r = rsqrtf(tot / 128.f + eps);
+        bf16 t = bfmul(qn[d], f2bf(xv * r));
+        srope[d] = t;
+        __syncthreads();
+        bf16 rot = (d < 64) ? bfneg(srope[d + 64]) : srope[d - 64];
+        srope[d] = bfadd(bfmul(t, cosb[d]),
+                         bfmul(rot, sinb[d]));
+        __syncthreads();
+        for (int s = d; s <= (int)p; s += 128) {
+            const bf16* krow = kbase + (long long)s * 128;
+            float dot = 0.f;
+            for (int dd = 0; dd < 128; ++dd)
+                dot += bf2f(srope[dd]) * bf2f(krow[dd]);
+            scores[s] = dot * scale;
+        }
+        __syncthreads();
+        float mx = -3.402823466e+38f;
+        for (int s = d; s <= (int)p; s += 128) mx = fmaxf(mx, scores[s]);
+        mx = fmaxf(mx, __shfl_down_sync(0xffffffffu, mx, 16));
+        mx = fmaxf(mx, __shfl_down_sync(0xffffffffu, mx, 8));
+        mx = fmaxf(mx, __shfl_down_sync(0xffffffffu, mx, 4));
+        mx = fmaxf(mx, __shfl_down_sync(0xffffffffu, mx, 2));
+        mx = fmaxf(mx, __shfl_down_sync(0xffffffffu, mx, 1));
+        if ((d & 31) == 0) red[d >> 5] = mx;
+        __syncthreads();
+        mx = fmaxf(fmaxf(red[0], red[1]), fmaxf(red[2], red[3]));
+        __syncthreads();
+        for (int s = d; s <= (int)p; s += 128)
+            scores[s] = expf(scores[s] - mx);
+        __syncthreads();
+        float sm = 0.f;
+        for (int s = d; s <= (int)p; s += 128) sm += scores[s];
+        sm += __shfl_down_sync(0xffffffffu, sm, 16);
+        sm += __shfl_down_sync(0xffffffffu, sm, 8);
+        sm += __shfl_down_sync(0xffffffffu, sm, 4);
+        sm += __shfl_down_sync(0xffffffffu, sm, 2);
+        sm += __shfl_down_sync(0xffffffffu, sm, 1);
+        if ((d & 31) == 0) red[d >> 5] = sm;
+        __syncthreads();
+        sm = red[0] + red[1] + red[2] + red[3];
+        __syncthreads();
+        bf16* pbv = (bf16*)(scores + (p + 2));
+        for (int s = d; s <= (int)p; s += 128)
+            pbv[s] = f2bf(scores[s] / sm);
+        __syncthreads();
+        float accv = 0.f;
+        for (int s = 0; s <= (int)p; ++s)
+            accv += bf2f(pbv[s]) * bf2f(vbase[(long long)s * 128 + d]);
+        out[((long long)b * 32 + h) * 128 + d] = f2bf(accv);
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ void step_all_k(
+        const long long* __restrict__ lw,   // [NL*10] weight+cache ptrs
+        const bf16* __restrict__ embed,     // [V,HDIM]
+        const bf16* __restrict__ finw,
+        const bf16* __restrict__ cost,      // [CAPT,128]
+        const bf16* __restrict__ sint,
+        long long* __restrict__ pos,        // [B]
+        long long* __restrict__ cur,        // [B]
+        bf16* __restrict__ hid,             // [B,HDIM]
+        bf16* __restrict__ hbuf,            // [B,2*HDIM]
+        bf16* __restrict__ qkv,             // [B,QKVD]
+        bf16* __restrict__ obuf,            // [B,ODIM]
+        bf16* __restrict__ gu,              // [B,GDIM]
+        float* __restrict__ logits,         // [B,VDIM]
+        float* __restrict__ amaxv,          // [NB*B]
+        int* __restrict__ amaxi,            // [NB*B]
+        unsigned* __restrict__ cnt,
+        unsigned* __restrict__ gen,
+        volatile long long* __restrict__ flag,   // host-mapped
+        volatile long long* __restrict__ tokm,   // host-mapped [O*B]
+        int B, int NL, int step_i, float eps, long long cap) {
+    int blk = blockIdx.x, tid = threadIdx.x;
+    int nblk = gridDim.x;
+    __shared__ float red[NT / 32];
+    __shared__ bf16 srope[128];
+    extern __shared__ float scores[];
+
+    bf16* h = hbuf;
+    bf16* h2 = hbuf + (long long)B * HDIM;
+
+    // embed current token into residual stream
+    if (blk < B) {
+        long long tok = cur[blk];
+        const bf16* e = embed + tok * (long long)HDIM;
+        bf16* o = hid + (long long)blk * HDIM;
+        for (int i = tid; i < HDIM; i += NT) o[i] = e[i];
+    }
+    gbar(cnt, gen);
+
+    for (int l = 0; l < NL; ++l) {
+        const bf16* w_ln_in = (const bf16*)lw[l * 10 + 0];
+        const bf16* wqkv    = (const bf16*)lw[l * 10 + 1];
+        const bf16* wqn     = (const bf16*)lw[l * 10 + 2];
+        const bf16* wkn     = (const bf16*)lw[l * 10 + 3];
+        const bf16* wo      = (const bf16*)lw[l * 10 + 4];
+        const bf16* w_ln2   = (const bf16*)lw[l * 10 + 5];
+        const bf16* wgu     = (const bf16*)lw[l * 10 + 6];
+        const bf16* wd      = (const bf16*)lw[l * 10 + 7];
+        bf16* kc            = (bf16*)lw[l * 10 + 8];
+        bf16* vc            = (bf16*)lw[l * 10 + 9];
+
+        if (blk < B) rms_row(hid + (long long)blk * HDIM, w_ln_in,
+                             h + (long long)blk * HDIM, eps, red);
+        gbar(cnt, gen);
+        gemv(wqkv, h, qkv, B, QKVD, HDIM, 0, 0, 0);
+        gbar(cnt, gen);
+        if (blk < B * 8) {
+            int b = blk / 8, j = blk % 8;
+            attn_unit(b, j, qkv + (long long)b * QKVD, wqn, wkn,
+                      cost, sint, kc, vc, pos[b],
+                      obuf, cap, 1.0f / 11.313708499f, eps,
+                      red, srope, scores);
+        }
+        gbar(cnt, gen);
+        gemv(wo, obuf, hid, B, HDIM, ODIM, hid, 0, 0);
+        gbar(cnt, gen);
+        if (blk < B) rms_row(hid + (long long)blk * HDIM, w_ln2,
+                             h2 + (long long)blk * HDIM, eps, red);
+        gbar(cnt, gen);
+        gemv(wgu, h2, gu, B, GDIM, HDIM, 0, 0, 0);
+        gbar(cnt, gen);
+        gemv(wd, 0, hid, B, HDIM, IDIM, hid, gu, 1);
+        gbar(cnt, gen);
+    }
+
+    if (blk < B) rms_row(hid + (long long)blk * HDIM, finw,
+                         h + (long long)blk * HDIM, eps, red);
+    gbar(cnt, gen);
+    gemv_f(embed, h, logits, B, VDIM, HDIM);
+    gbar(cnt, gen);
+
+    // argmax over logits[b, :VDIM]. Block slice s of row b scans
+    // [s*VDIM/per, (s+1)*VDIM/per); per-block winner goes to scratch,
+    // then blocks 0..B-1 reduce their row's slice winners.
+    __shared__ float sval[NT / 32];
+    __shared__ int sidx[NT / 32];
+    int per = nblk / B;
+    if (blk < B * per) {
+        int b = blk % B, s = blk / B;
+        int lo = (int)(((long long)s * VDIM) / per);
+        int hi = (int)(((long long)(s + 1) * VDIM) / per);
+        const float* lg = logits + (long long)b * VDIM;
+        float mv = -3.402823466e+38f;
+        int mi = lo;
+        for (int i = lo + tid; i < hi; i += NT) {
+            float v = lg[i];
+            if (v > mv || (v == mv && i < mi)) { mv = v; mi = i; }
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            float ov = __shfl_down_sync(0xffffffffu, mv, off);
+            int oi = __shfl_down_sync(0xffffffffu, mi, off);
+            if (ov > mv || (ov == mv && oi < mi)) { mv = ov; mi = oi; }
+        }
+        if ((tid & 31) == 0) { sval[tid >> 5] = mv; sidx[tid >> 5] = mi; }
+        __syncthreads();
+        if (tid < 32) {
+            mv = (tid < NT / 32) ? sval[tid] : -3.402823466e+38f;
+            mi = (tid < NT / 32) ? sidx[tid] : VDIM;
+            for (int off = 4; off > 0; off >>= 1) {
+                float ov = __shfl_down_sync(0xffffffffu, mv, off);
+                int oi = __shfl_down_sync(0xffffffffu, mi, off);
+                if (ov > mv || (ov == mv && oi < mi)) { mv = ov; mi = oi; }
+            }
+            if (tid == 0) { amaxv[blk] = mv; amaxi[blk] = mi; }
+        }
+    }
+    gbar(cnt, gen);
+    if (blk < B && tid == 0) {
+        float mv = -3.402823466e+38f;
+        int mi = VDIM;
+        for (int s = 0; s < per; ++s) {
+            float v = amaxv[s * B + blk];
+            int i = amaxi[s * B + blk];
+            if (v > mv || (v == mv && i < mi)) { mv = v; mi = i; }
+        }
+        cur[blk] = (long long)mi;
+        tokm[(long long)(step_i % 512) * B + blk] = (long long)mi;
+        pos[blk] += 1;
+        __threadfence_system();
+    }
+    gbar(cnt, gen);
+    if (blk == 0 && tid == 0) flag[0] = (long long)(step_i + 1);
+}
+"""
+
 
 class Rtc:
     """Thin ctypes wrapper over libnvrtc + libcuda driver API."""
@@ -379,7 +731,8 @@ class Rtc:
             raise OSError(f"no libnvrtc: {last}")
         self.cuda = ctypes.CDLL("libcuda.so.1")
         for name in ("cuModuleLoadData", "cuModuleGetFunction",
-                     "cuLaunchKernel"):
+                     "cuLaunchKernel", "cuMemHostAlloc",
+                     "cuMemHostGetDevicePointer"):
             getattr(self.cuda, name)
         for name in ("nvrtcCreateProgram", "nvrtcCompileProgram",
                      "nvrtcGetPTXSize", "nvrtcGetPTX",
@@ -460,6 +813,10 @@ class RtcKernels:
             self.silu = self.rtc.compile(SILU_SRC, "silu", "silu_k")
             self.mega = self.rtc.compile(ATTN_MEGA_SRC, "mega",
                                        "attn_mega_k")
+            self.megafn = self.rtc.compile(MEGA_SRC, "stepall",
+                                           "step_all_k")
+            self.nblk = torch.cuda.get_device_properties(
+                0).multi_processor_count
 
     @property
     def ok(self):
@@ -493,3 +850,33 @@ class RtcKernels:
         n = gu.shape[0] * I
         self.rtc.launch(self.silu, (n + 127) // 128, 128, 0,
                         [ptr(gu), ptr(out), i32(I)])
+
+    def host_map(self, nbytes):
+        """Devicemapped host buffer -> (host ctypes array, device ptr)."""
+        hp = ctypes.c_void_p()
+        rc = self.rtc.cuda.cuMemHostAlloc(ctypes.byref(hp), nbytes, 0x03)
+        if rc or not hp:
+            raise RuntimeError(f"cuMemHostAlloc rc={rc}")
+        dp = ctypes.c_void_p()
+        rc = self.rtc.cuda.cuMemHostGetDevicePointer(
+            ctypes.byref(dp), hp, 0)
+        if rc or not dp:
+            raise RuntimeError(f"cuMemHostGetDevicePointer rc={rc}")
+        buf = (ctypes.c_longlong * (nbytes // 8)).from_address(hp.value)
+        for i in range(nbytes // 8):
+            buf[i] = 0
+        return buf, dp.value
+
+    def step_all(self, lw, embed, finw, cost, sint, pos, cur, hid, hbuf,
+                 qkv, obuf, gu, logits, amaxv, amaxi, cnt, gen,
+                 flag_dev, tokm_dev, B, NL, step_i, eps, cap):
+        smem = (cap + 8) * 6 + 512
+        self.rtc.launch(self.megafn, self.nblk, 256, smem,
+                        [ptr(lw), ptr(embed), ptr(finw), ptr(cost),
+                         ptr(sint), ptr(pos), ptr(cur), ptr(hid),
+                         ptr(hbuf), ptr(qkv), ptr(obuf), ptr(gu),
+                         ptr(logits), ptr(amaxv), ptr(amaxi),
+                         ptr(cnt), ptr(gen),
+                         ctypes.c_void_p(flag_dev),
+                         ctypes.c_void_p(tokm_dev),
+                         i32(B), i32(NL), i32(step_i), f32(eps), i64(cap)])
