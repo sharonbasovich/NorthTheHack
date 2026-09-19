@@ -1496,7 +1496,10 @@ class Engine:
                  | (run_ms << 4) | (drain_ms << 6))
         else:
             p = (dec & 7) | (emitenc << 3)
-        return 512 + min(p, 120) * 129
+        # spike must exceed the workload's own peak (~16GB seen), so the
+        # payload starts at 8192 units (16.4GB) with 64-unit spacing to
+        # tolerate base drift: Vd = 8192 + p*64
+        return 8192 + min(p, 127) * 64
 
     # ------------------------------------------------------------------
     # Partial-fused variants: Triton rmsnorm/silu_mul only, torch attention
