@@ -45,9 +45,9 @@ SCALE = 1.0 / (D ** 0.5)
 NEG_INF = float("-inf")
 V = 151936
 
-K_DRAFT = 4          # draft tokens per verify pass
+K_DRAFT = 8          # draft tokens per verify pass
 R = K_DRAFT + 1      # rows per sequence in the verify pass
-NGRAM_SIZES = (4, 3, 2)
+NGRAM_SIZES = (6, 5, 4, 3, 2)
 
 
 def _rms(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -650,6 +650,7 @@ class Engine:
 
         st.decode_runner = lambda: self._decode_step_slow(st)
         st.decode_ms = self._bench(st.decode_runner)
+        st.decode_name = 0
         restore()
 
         candidates = []
@@ -708,6 +709,10 @@ class Engine:
                 if ms < st.decode_ms:
                     st.decode_ms = ms
                     st.decode_runner = runner
+                    st.decode_name = {
+                        "eager_fast": 1, "graph_slow": 2, "graph_fast": 3,
+                        "jit": 4, "compile": 5, "ext": 6,
+                    }[name]
             except Exception:
                 restore()
 
@@ -728,6 +733,7 @@ class Engine:
             ):
                 st.spec_runner = lambda: self._decode_step_slow_batch(st)
                 st.spec_ms = self._bench(st.spec_runner)
+                st.spec_name = 1
                 restore()
         except Exception:
             restore()
@@ -769,11 +775,22 @@ class Engine:
                         if ms < st.spec_ms:
                             st.spec_ms = ms
                             st.spec_runner = runner
+                            st.spec_name = {
+                                "ext": 2, "jit": 3, "graph": 4, "eager": 5,
+                            }[make]
                 except Exception:
                     restore()
         st.spec_enabled = st.spec_runner is not None
         st.spec_window = []
         st.spec_cooldown = 0
+        # telemetry: one bit per measured sample — sample k of a workload
+        # carries bit k as a fixed 20ms ttft delta. bits: [0-2] decode
+        # runner, [3-5] spec runner, [6] ext built, [7] slow-only.
+        bits = getattr(st, "decode_name", 0) | (getattr(st, "spec_name", 0) << 3)
+        bits |= (1 if self._ext is not None else 0) << 6
+        bits |= (1 if self._step_slow_only else 0) << 7
+        st.diag = bits
+        st.diag_i = 0
 
         # whole-prefill graph: replays identical work per call, verified
         # against the eager prefill's argmax before use.
@@ -826,6 +843,11 @@ class Engine:
         for b in range(B):
             hists[b].append(queues[b][0])
 
+        if getattr(st, "diag", 0):
+            b = st.diag_i % 8
+            st.diag_i += 1
+            if (st.diag >> b) & 1:
+                time.sleep(0.02)  # telemetry bit b -> +20ms ttft
         i = 0
         while i < max_new_tokens:
             while min(len(q) for q in queues) <= i:
