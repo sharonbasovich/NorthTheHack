@@ -177,6 +177,7 @@ class _State:
         self.cos = emb.cos().to(torch.bfloat16)
         self.sin = emb.sin().to(torch.bfloat16)
         self.pin = torch.empty(batch, dtype=torch.int64, pin_memory=True)
+        self.pin2 = torch.empty(2, batch, dtype=torch.int64, pin_memory=True)
         self.cur_pin = torch.empty(batch, dtype=torch.int64, pin_memory=True)
         # fused-path scratch, sized for R rows/sequence
         n = batch * R
@@ -207,6 +208,8 @@ class _State:
         self.first_dev = None        # [B] argmax output of captured prefill
         self.spec_cooldown = 0       # passes to run decode-only (weak drafting)
         self.spec_window = []        # recent emit counts for adaptivity
+        self.ptog = 0
+        self.ppending = None
 
 
 class Engine:
@@ -952,8 +955,10 @@ class Engine:
         self._choose_path = 4
 
         candidates = []
-        # graph first: replay collapses the ~1400 launches of the slow step
-        # into one — the largest available win on this launch-bound box.
+        # compile first: Inductor fuses the whole step into a handful of
+        # kernels — fewest CUDA calls, which is the gVisor bottleneck.
+        if self._probe("compile"):
+            candidates.append(("compile", "compile"))
         if self._probe("graph"):
             candidates.append(("graph_slow", self._decode_step_slow))
             if _HAS_TRITON and not self._step_slow_only:
@@ -966,8 +971,6 @@ class Engine:
             candidates.append(("eager_rms", lambda s=st: self._decode_step_rms(s)))
         # jit only as a fallback: tracing ~1300 ops costs ~10-60s per call,
         # so skip it entirely when the C++ ext loaded (it strictly dominates).
-        if self._probe("compile"):
-            candidates.append(("compile", "compile"))
         if self._ext is None and self._probe("jit"):
             candidates.append(("jit", "jit"))
         self._cand_mask = 0
@@ -1022,10 +1025,10 @@ class Engine:
                 elif name == "compile":
                     disarm = self._watchdog(100)
                     try:
-                        comp = torch.compile(
-                            lambda: self._decode_step_slow_ret(st),
-                            (), fullgraph=False)
-                        comp()
+                        _f = torch.compile(self._decode_step_slow_ret,
+                                           fullgraph=False)
+                        runner = lambda: _f(st)
+                        runner()
                     finally:
                         disarm()
                     ok = self._margin_ok(ref_logits, st.cur[:, 0], 1.9)
@@ -1209,6 +1212,8 @@ class Engine:
         except Exception:
             pass
         st.spec_cooldown = 0
+        st.ptog = 0
+        st.ppending = None
         if DIAG_BOOM and st.B == 1:
             # die on the first public workload with diagnostics packed into
             # the exception — the run reports caseMessage even when stdout
@@ -1419,7 +1424,16 @@ class Engine:
         st.diag_i = getattr(st, "diag_i", 0) + 1
         i = 0
         while i < max_new_tokens:
-            while min(len(q) for q in queues) <= i:
+            while min(len(q) for q in queues) <= i or getattr(st, "ppending", None) is not None:
+                if (getattr(st, "ppending", None) is not None
+                        and min(len(q) for q in queues) > i):
+                    self._drain(st.pin2[1 - st.ppending])
+                    toks = st.pin2[1 - st.ppending].tolist()
+                    for b in range(B):
+                        queues[b].append(toks[b])
+                        hists[b].append(toks[b])
+                    st.ppending = None
+                    continue
                 if st.spec_enabled and st.spec_cooldown == 0:
                     m_mean = self._spec_pass(st, queues, hists)
                     st.spec_window.append(m_mean)
@@ -1436,12 +1450,16 @@ class Engine:
                     # st.cur already holds the last emitted token (written
                     # on-device by the previous step) — no H2D needed.
                     st.decode_runner()
-                    st.pin.fill_(-1)
-                    st.pin.copy_(st.cur[:, 0], non_blocking=True)
-                    self._drain(st.pin)
-                    toks = st.pin.tolist()
-                    for b in range(B):
-                        queues[b].append(toks[b])
-                        hists[b].append(toks[b])
+                    pi = st.ptog
+                    st.pin2[pi].fill_(-1)
+                    st.pin2[pi].copy_(st.cur[:, 0], non_blocking=True)
+                    if st.ppending is not None:
+                        self._drain(st.pin2[1 - st.ppending])
+                        toks = st.pin2[1 - st.ppending].tolist()
+                        for b in range(B):
+                            queues[b].append(toks[b])
+                            hists[b].append(toks[b])
+                    st.ppending = pi
+                    st.ptog ^= 1
             yield [queues[b][i] for b in range(B)]
             i += 1
