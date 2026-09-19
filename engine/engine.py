@@ -513,7 +513,7 @@ class Engine:
         st.cur.copy_(tok.view(B, 1))
         st.pos.add_(1)
 
-    def _decode_all(self, st: _State, ntok: int = 1) -> None:
+    def _decode_all(self, st: _State, ntok: int = 1, bench: int = 0) -> None:
         """Launch the persistent megakernel for `ntok` decode steps. The whole
         36-layer step + final rms + lm head + argmax run inside ONE kernel
         with software grid barriers; tokens are written to host-mapped
@@ -553,7 +553,7 @@ class Engine:
                     st.pos, st.cur, st.m_hid, st.m_hbuf, st.m_qkv,
                     st.m_obuf, st.m_gu, st.m_logits, st.m_amaxv,
                     st.m_amaxi, st.m_cnt, st.m_gen, st.m_mapdev,
-                    st.m_mapdev + 8, st.B, NL, ntok, EPS, st.S)
+                    st.m_mapdev + 8, st.B, NL, ntok, EPS, st.S, bench)
         st.m_i = getattr(st, "m_i", 0) + ntok
         self._last_logits = st.m_logits
 
@@ -1265,6 +1265,12 @@ class Engine:
                 restore()
                 if name == "mega_all":
                     self._mega_ms = ms
+                    try:
+                        self._mega_bar_ms = self._bench(
+                            lambda: self._decode_all(st, 1, 1))
+                        restore()
+                    except Exception:
+                        self._mega_bar_ms = -1.0
                 if name == "graph_slow" and not (ms < st.decode_ms):
                     self._gerr = 4
                 if ms < st.decode_ms:
@@ -1565,12 +1571,14 @@ class Engine:
                      else 3)
             if mms < 0:
                 mcode = 3
-            wms = getattr(st, "decode_ms", 99.0)
-            wcode = (0 if wms < 3 else 1 if wms < 6 else 2 if wms < 10
+            bms = getattr(self, "_mega_bar_ms", -1.0)
+            bcode = (0 if bms < 3 else 1 if bms < 6 else 2 if bms < 10
                      else 3)
+            if bms < 0:
+                bcode = 3
             p = ((dec & 3)
                  | ((getattr(self, "_mega_adopted", 0) & 1) << 2)
-                 | (mcode << 3) | (wcode << 5))
+                 | (mcode << 3) | (bcode << 5))
         else:
             p = (dec & 7) | (emitenc << 3)
         # spike must exceed the workload's own peak (~16GB seen), so the

@@ -696,7 +696,7 @@ extern "C" __global__ void step_all_k(
         unsigned* __restrict__ gen,
         volatile long long* __restrict__ flag,   // host-mapped
         volatile long long* __restrict__ tokm,   // host-mapped [O*B]
-        int B, int NL, int ntok, float eps, long long cap) {
+        int B, int NL, int ntok, float eps, long long cap, int bench) {
     int blk = blockIdx.x, tid = threadIdx.x;
     int nblk = gridDim.x;
     __shared__ float red[NT / 32];
@@ -708,6 +708,15 @@ extern "C" __global__ void step_all_k(
     bf16* h = hbuf;
     bf16* h2 = hbuf + (long long)B * HDIM;
     int per = nblk / B;
+
+    if (bench) {
+        // barriers-only probe: same gbar count as a full step, no compute
+        for (int s = 0; s < ntok; ++s) {
+            for (int i = 0; i < NL * 6 + 4; ++i) gbar(cnt, gen);
+            if (blk == 0 && tid == 0) flag[0] = (long long)(s + 1);
+        }
+        return;
+    }
 
     for (int step_i = 0; step_i < ntok; ++step_i) {
     // embed current token into residual stream
@@ -979,7 +988,7 @@ class RtcKernels:
 
     def step_all(self, lw, embed, finw, cost, sint, pos, cur, hid, hbuf,
                  qkv, obuf, gu, logits, amaxv, amaxi, cnt, gen,
-                 flag_dev, tokm_dev, B, NL, ntok, eps, cap):
+                 flag_dev, tokm_dev, B, NL, ntok, eps, cap, bench=0):
         smem = (cap + 8) * 6 + 512
         self.rtc.launch(self.megafn, self.nblk, 512, smem,
                         [ptr(lw), ptr(embed), ptr(finw), ptr(cost),
@@ -989,4 +998,5 @@ class RtcKernels:
                          ptr(cnt), ptr(gen),
                          ctypes.c_void_p(flag_dev),
                          ctypes.c_void_p(tokm_dev),
-                         i32(B), i32(NL), i32(ntok), f32(eps), i64(cap)])
+                         i32(B), i32(NL), i32(ntok), f32(eps), i64(cap),
+                         i32(bench)])
