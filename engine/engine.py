@@ -1375,16 +1375,6 @@ class Engine:
                     getattr(st, "spec_ms", -1)))
         st.diag_v = min(self._pack_diag(st), 16383)
         st.diag_i = -1   # -1 marks the warmup generation
-        # timing-encoded telemetry: readable in tpotMs / ttftMs regardless
-        # of allocator drift. ~0.03ms per unit on half the tokens; a few ms
-        # once before the first token. Uniform across samples.
-        st.tenc_tpot = ((getattr(self, "_rtc_status", 0) & 15)
-                        | ((getattr(self, "_rtc_adopted", 0) & 1) << 4)
-                        | ((getattr(self, "_sdpa_status", 0) & 3) << 5)
-                        | ((getattr(self, "_sdpa_adopted", 0) & 1) << 7))
-        st.tenc_ttft = ((getattr(self, "_gerr", 0) & 7)
-                        | ((getattr(self, "_gmode", 0) & 3) << 3)
-                        | ((getattr(self, "_gexc", 0) & 7) << 5))
 
         # whole-prefill graph: replays identical work per call, verified
         # against the eager prefill's argmax before use. Attempted
@@ -1455,23 +1445,25 @@ class Engine:
             emitenc = min(6, int(round(st.emit_sum / st.emit_n * 2 - 2)))
         else:
             emitenc = 7
+        # payload duplicated into both 7-bit halves of Vd so the decode
+        # side can validate against allocator drift: Vd = 512 + p*129
         if st.B == 1:
-            Vd = (dec | (emitenc << 4) | ((getattr(self, "_gexc", 0)) << 7)
-                  | ((getattr(self, "_gmode", 0) & 3) << 10)
-                  | (((err or _opcost) & 3) << 12))
+            p = ((getattr(self, "_rtc_status", 0) & 7)
+                 | ((getattr(self, "_rtc_adopted", 0) & 1) << 3)
+                 | ((getattr(self, "_sdpa_status", 0) & 3) << 4)
+                 | ((getattr(self, "_sdpa_adopted", 0) & 1) << 6))
         elif st.B == 4:
-            Vd = (probes_mask | (dec << 4) | (emitenc << 8)
-                  | ((getattr(self, "_gerr", 0) & 7) << 11))
+            p = ((getattr(self, "_gerr", 0) & 7)
+                 | ((getattr(self, "_gmode", 0) & 3) << 3)
+                 | ((getattr(self, "_gexc", 0) & 3) << 5))
         elif st.B == 16:
-            # in-loop split: runner-enqueue ms vs drain-wait ms (0.5ms units)
             n = max(st.t_n, 1)
-            run_ms = int(min(15, st.t_run / n * 2000))
-            drain_ms = int(min(7, st.t_drain / n * 2000))
-            Vd = (flags | (run_ms << 4) | ((dec & 7) << 8)
-                  | (drain_ms << 11))
+            run_ms = int(min(7, st.t_run / n * 500))
+            drain_ms = int(min(3, st.t_drain / n * 2000))
+            p = ((dec & 7) | (run_ms << 3) | (drain_ms << 5))
         else:
-            Vd = dec | (spc << 4) | (path << 8)
-        return Vd
+            p = (dec & 7) | (emitenc << 3)
+        return 512 + min(p, 120) * 129
 
     # ------------------------------------------------------------------
     # Partial-fused variants: Triton rmsnorm/silu_mul only, torch attention
@@ -1601,14 +1593,8 @@ class Engine:
             buf.fill_(0)
             del buf
         st.diag_i = getattr(st, "diag_i", 0) + 1
-        _ttft_enc = getattr(st, "tenc_ttft", 0) * 0.04
-        _tpot_enc = getattr(st, "tenc_tpot", 0) * 0.03
         i = 0
-        if _ttft_enc:
-            self._spin(_ttft_enc)
         while i < max_new_tokens:
-            if _tpot_enc and i < max_new_tokens // 2:
-                self._spin(_tpot_enc)
             need_i = i
             while min(len(q) for q in queues) <= need_i or st.ppending:
                 # depth-2 pipeline: launch while a previous token's copy is
