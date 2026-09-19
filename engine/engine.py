@@ -323,7 +323,7 @@ class Engine:
         x = F.embedding(st.cur, self.embed_w)  # [B,1,H]
         cos = st.cos.index_select(0, st.pos).view(B, 1, 1, D)
         sin = st.sin.index_select(0, st.pos).view(B, 1, 1, D)
-        valid = st.srange[None, :] <= st.pos[:, None]
+        nvalid = st.srange[None, :] > st.pos[:, None]
         for i, w in enumerate(self.layers):
             h = _rms(x, w["ln_in"]).view(B, H)
             qkv = h @ w["wqkv"].t()
@@ -341,7 +341,7 @@ class Engine:
             )
             qg = qe.reshape(B, NKV, GROUP, D)
             scores = torch.matmul(qg, st.kc[i].transpose(-1, -2)) * SCALE
-            scores.masked_fill_(~valid[:, None, None, :], NEG_INF)
+            scores.masked_fill_(nvalid[:, None, None, :], NEG_INF)
             p = torch.softmax(scores.float(), dim=-1).to(torch.bfloat16)
             o = torch.matmul(p, st.vc[i]).view(B, NQ * D)
             xf = x.view(B, H)
@@ -369,9 +369,9 @@ class Engine:
         x = F.embedding(st.inp, self.embed_w)               # [B,R,H]
         cos = st.cos.index_select(0, pos_r.reshape(-1)).view(B, R, 1, D)
         sin = st.sin.index_select(0, pos_r.reshape(-1)).view(B, R, 1, D)
-        valid = st.srange[None, None, :] <= pos_r[:, :, None]  # [B,R,S]
+        nvalid = st.srange[None, None, :] > pos_r[:, :, None]  # [B,R,S]
         bi = st.iB.view(B, 1, 1).expand(B, R, NKV)
-        gi = st.jj.view(1, 1, NKV).expand(B, R, NKV)
+        gi = st.jj[:1].view(1, 1, NKV).expand(B, R, NKV)
         pi = pos_r[:, :, None].expand(B, R, NKV)
         for i, w in enumerate(self.layers):
             h = _rms(x, w["ln_in"]).view(B * R, H)
@@ -388,7 +388,7 @@ class Engine:
             scores = torch.matmul(
                 qg, st.kc[i].unsqueeze(1).transpose(-1, -2)
             ) * SCALE                                    # [B,R,NKV,G,S]
-            scores.masked_fill_(~valid[:, :, None, None, :], NEG_INF)
+            scores.masked_fill_(nvalid[:, :, None, None, :], NEG_INF)
             p = torch.softmax(scores.float(), dim=-1).to(torch.bfloat16)
             o = torch.matmul(
                 p, st.vc[i].unsqueeze(1).expand(B, R, NKV, st.S, D)
@@ -507,7 +507,7 @@ class Engine:
             step(st)
         return g
 
-    def _bench(self, fn, iters: int = 4) -> float:
+    def _bench(self, fn, iters: int = 3) -> float:
         """ms/call wall-clock for fn(), whatever it does internally."""
         try:
             fn()
@@ -526,6 +526,17 @@ class Engine:
         cached = self._probes.get(kind)
         if cached is not None:
             return cached
+        # probe results are shape-independent: reuse across processes
+        try:
+            f = open("/tmp/kr_probes.json")
+            import json as _j
+            res = _j.load(f)
+            f.close()
+            if kind in res:
+                self._probes[kind] = res[kind]
+                return res[kind]
+        except Exception:
+            res = {}
         ok = False
         try:
             if kind == "graph":
@@ -551,6 +562,13 @@ class Engine:
         except Exception:
             ok = False
         self._probes[kind] = ok
+        try:
+            import json as _j
+            res[kind] = ok
+            with open("/tmp/kr_probes.json", "w") as f:
+                _j.dump(res, f)
+        except Exception:
+            pass
         return ok
 
     def _load_ext(self, st: _State):
@@ -562,6 +580,13 @@ class Engine:
             return self._ext
         self._ext_tried = True
         try:
+            # cross-process markers: at most one cold compile per run
+            done_f, busy_f = "/tmp/kr_ext_done", "/tmp/kr_ext_busy"
+            if os.path.exists(done_f):
+                if open(done_f).read().strip() != "ok":
+                    return None
+            elif os.path.exists(busy_f):
+                return None
             import shutil
             if not ((shutil.which("c++") or shutil.which("g++")
                      or shutil.which("cc")) and shutil.which("ninja")):
@@ -571,12 +596,21 @@ class Engine:
             bdir = _get_build_directory("kr_decode_ext", verbose=False)
             warm = os.path.exists(os.path.join(bdir, "kr_decode_ext.so"))
             # a cold compile is ~60-120s; a warm load is ~1-2s. Only burn a
-            # cold build while well inside the 300s load+warmup budget.
-            if not warm and time.time() - self._t0 > 180:
-                return None
+            # cold build while well inside the 300s load+warmup budget, and
+            # only from the first process that tries.
+            if not warm:
+                if time.time() - self._t0 > 90:
+                    return None
+                open(busy_f, "w").write("1")
             src = os.path.join(os.path.dirname(__file__),
                                "kernels", "decode_ext.cpp")
-            mod = load(name="kr_decode_ext", sources=[src], verbose=False)
+            try:
+                mod = load(name="kr_decode_ext", sources=[src], verbose=False)
+            finally:
+                try:
+                    os.remove(busy_f)
+                except Exception:
+                    pass
             weights = [self.embed_w, self.lm_w, self.fin_w]
             for w in self.layers:
                 weights += [w["ln_in"], w["wqkv"], w["wo"],
@@ -587,8 +621,16 @@ class Engine:
             mod.init(weights, st.kc, st.vc, state,
                      st.B, NL, NQ, NKV, D, H, I, V, R, st.S, EPS, SCALE)
             self._ext = mod
+            try:
+                open(done_f, "w").write("ok")
+            except Exception:
+                pass
             return mod
         except Exception:
+            try:
+                open(done_f, "w").write("fail")
+            except Exception:
+                pass
             return None
 
     def _spec_pass(self, st: _State, queues, hists) -> int:
@@ -629,8 +671,14 @@ class Engine:
         that reproduces the slow step's token. Also probes the spec pass.
 
         Runs inside the warmup generation, which is untimed (300s budget).
-        Mutates cur/pos freely — caller resets afterwards.
+        Mutates cur/pos freely — caller resets afterwards. Capped at ~40s so
+        six workloads' choosing can't exceed the run's 15-minute limit.
         """
+        choose_t0 = time.time()
+
+        def over_budget() -> bool:
+            return time.time() - choose_t0 > 40.0
+
         c0 = st.cur.clone()
         p0 = st.pos.clone()
 
@@ -653,7 +701,7 @@ class Engine:
         st.decode_name = 0
         restore()
 
-        candidates = []
+        candidates = [("ext", "ext")]
         if _HAS_TRITON and not self._step_slow_only:
             candidates.append(("eager_fast", lambda s=st: self._decode_step_fast(s)))
         if self._probe("graph"):
@@ -662,11 +710,10 @@ class Engine:
                 candidates.append(("graph_fast", self._decode_step_fast))
         if self._probe("jit"):
             candidates.append(("jit", "jit"))
-        if self._probe("compile"):
-            candidates.append(("compile", "compile"))
-        candidates.append(("ext", "ext"))
 
         for name, what in candidates:
+            if over_budget():
+                break
             try:
                 if name == "ext":
                     mod = self._load_ext(st)
@@ -739,6 +786,8 @@ class Engine:
             restore()
         if ref_logits_b is not None:
             for make in ("ext", "jit", "graph", "eager"):
+                if over_budget():
+                    break
                 try:
                     if make == "ext":
                         if self._load_ext(st) is None:
