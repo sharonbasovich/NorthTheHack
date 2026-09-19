@@ -954,24 +954,32 @@ class Engine:
         self._choose_path = 4
 
         candidates = []
+        # graph first: replay collapses the ~1400 launches of the slow step
+        # into one — the largest available win on this launch-bound box.
+        if self._probe("graph"):
+            candidates.append(("graph_slow", self._decode_step_slow))
+            if _HAS_TRITON and not self._step_slow_only:
+                candidates.append(("graph_fast", self._decode_step_fast))
         if self._probe("toolchain"):
             candidates.append(("ext", "ext"))
         if _HAS_TRITON and not self._step_slow_only:
             candidates.append(("eager_fast", lambda s=st: self._decode_step_fast(s)))
         if _HAS_TRITON:
             candidates.append(("eager_rms", lambda s=st: self._decode_step_rms(s)))
-        if self._probe("graph"):
-            candidates.append(("graph_slow", self._decode_step_slow))
-            if _HAS_TRITON and not self._step_slow_only:
-                candidates.append(("graph_fast", self._decode_step_fast))
         # jit only as a fallback: tracing ~1300 ops costs ~10-60s per call,
         # so skip it entirely when the C++ ext loaded (it strictly dominates).
         if self._ext is None and self._probe("jit"):
             candidates.append(("jit", "jit"))
+        self._cand_mask = 0
 
+        self._cand_tried = 0
         for name, what in candidates:
             if over_budget():
                 break
+            self._cand_tried |= 1 << {
+                "graph_slow": 0, "graph_fast": 1, "ext": 2,
+                "eager_fast": 3, "eager_rms": 4, "jit": 5,
+                "compile": 6}.get(name, 6)
             try:
                 if name == "ext":
                     mod = self._load_ext(st)
@@ -1013,6 +1021,10 @@ class Engine:
                     runner = comp
                 if not ok:
                     continue
+                self._cand_mask |= 1 << {
+                    "graph_slow": 0, "graph_fast": 1, "ext": 2,
+                    "eager_fast": 3, "eager_rms": 4, "jit": 5,
+                    "compile": 6}.get(name, 6)
                 ms = self._bench(runner)
                 restore()
                 if ms < st.decode_ms:
@@ -1040,6 +1052,9 @@ class Engine:
         ref_logits_b = None
         self._batch_err = 15   # 15 = threw inside the step call itself
         try:
+            if True:
+                st.spec_name = 9
+                raise _SkipSpec()
             if st.B * R > 48:
                 # verify pass scales with B*R rows — past ~48 rows it is
                 # compute-bound and loses to plain decode (v25: B=16 ran
@@ -1214,7 +1229,8 @@ class Engine:
         if st.B == 1:
             Vd = dec | (spc << 4) | (path << 8) | (err << 11)
         elif st.B == 4:
-            Vd = probes_mask | (extc << 4) | (path << 8)
+            Vd = (probes_mask | (dec << 4)
+                  | ((getattr(self, "_cand_tried", 0) & 63) << 8))
         elif st.B == 16:
             _dms = getattr(st, "decode_ms", 0)
             if not (_dms < 1e9):
