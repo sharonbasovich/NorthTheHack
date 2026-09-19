@@ -1450,17 +1450,18 @@ class Engine:
         if st.B == 1:
             p = ((getattr(self, "_rtc_status", 0) & 7)
                  | ((getattr(self, "_rtc_adopted", 0) & 1) << 3)
-                 | ((getattr(self, "_sdpa_status", 0) & 3) << 4)
-                 | ((getattr(self, "_sdpa_adopted", 0) & 1) << 6))
+                 | ((dec & 7) << 4))
         elif st.B == 4:
             p = ((getattr(self, "_gerr", 0) & 7)
                  | ((getattr(self, "_gmode", 0) & 3) << 3)
-                 | ((getattr(self, "_gexc", 0) & 3) << 5))
+                 | ((dec & 3) << 5))
         elif st.B == 16:
             n = max(st.t_n, 1)
-            run_ms = int(min(7, st.t_run / n * 500))
-            drain_ms = int(min(3, st.t_drain / n * 2000))
-            p = ((dec & 7) | (run_ms << 3) | (drain_ms << 5))
+            run_ms = int(min(3, st.t_run / n * 1000))
+            drain_ms = int(min(1, st.t_drain / n * 1000))
+            p = ((dec & 7)
+                 | ((getattr(self, "_rtc_adopted", 0) & 1) << 3)
+                 | (run_ms << 4) | (drain_ms << 6))
         else:
             p = (dec & 7) | (emitenc << 3)
         return 512 + min(p, 120) * 129
