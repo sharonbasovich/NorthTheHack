@@ -483,6 +483,36 @@ class Engine:
         st.cur.copy_(tok.view(B, 1))
         st.pos.add_(1)
 
+    def _decode_step_rtc2(self, st: _State) -> None:
+        """RTC step with rope+cache+attention merged into one kernel:
+        ~8 launches/layer."""
+        B = st.B
+        rk = self._rtk
+        if getattr(st, "obuf", None) is None:
+            st.obuf = torch.empty(B, NQ * D, dtype=torch.bfloat16,
+                                  device=self.dev)
+        x = F.embedding(st.cur, self.embed_w)
+        cosb = st.cos.index_select(0, st.pos)
+        sinb = st.sin.index_select(0, st.pos)
+        for i, w in enumerate(self.layers):
+            rk.rms_norm(x.view(B, H), w["ln_in"], st.h[:B], H, EPS)
+            qkv = st.h[:B] @ w["wqkv"].t()
+            rk.attn_mega(qkv, w["qn"], w["kn"], cosb, sinb,
+                         st.kc[i], st.vc[i], st.pos, st.obuf, st.S, B, st.S)
+            x = torch.addmm(x.view(B, H), st.obuf, w["wo"].t()) \
+                .view(B, 1, H)
+            rk.rms_norm(x.view(B, H), w["ln_post"], st.h2[:B], H, EPS)
+            gu = st.h2[:B] @ w["wgu"].t()
+            rk.silu_mul(gu, st.mlp[:B], I)
+            x = torch.addmm(x.view(B, H), st.mlp[:B], w["wd"].t()) \
+                .view(B, 1, H)
+        x = _rms(x, self.fin_w)
+        logits = x.view(B, H) @ self.lm_w.t()
+        self._last_logits = logits
+        tok = logits.argmax(dim=-1)
+        st.cur.copy_(tok.view(B, 1))
+        st.pos.add_(1)
+
     # ------------------------------------------------------------------
     # Plain-torch single-token fallback (same math, more kernels).
     # ------------------------------------------------------------------
@@ -1075,6 +1105,8 @@ class Engine:
                 self._rtk = False
                 self._rtc_status = 4
         if self._rtk:
+            candidates.append(("eager_rtc2",
+                               lambda s=st: self._decode_step_rtc2(s)))
             candidates.append(("eager_rtc",
                                lambda s=st: self._decode_step_rtc(s)))
         candidates.append(("eager_sdpa",
@@ -1109,7 +1141,7 @@ class Engine:
                     restore()
                     runner = mod.step
                 elif name in ("eager_fast", "eager_rms", "eager_sdpa",
-                              "eager_rtc"):
+                              "eager_rtc", "eager_rtc2"):
                     runner = what
                     runner()
                     ok = self._margin_ok(ref_logits, st.cur[:, 0], 1.9)
@@ -1179,7 +1211,7 @@ class Engine:
                     st.decode_name = {
                         "eager_fast": 1, "graph_slow": 2, "graph_fast": 3,
                         "jit": 4, "compile": 5, "ext": 6, "eager_rms": 7,
-                        "eager_sdpa": 5, "eager_rtc": 3,
+                        "eager_sdpa": 5, "eager_rtc": 3, "eager_rtc2": 4,
                     }[name]
                     if name == "graph_slow":
                         self._gerr = 1

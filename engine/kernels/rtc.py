@@ -200,6 +200,145 @@ extern "C" __global__ void attn_k(
 }
 """
 
+ATTN_MEGA_SRC = BF16_HELPERS + r"""
+// One kernel for rope + cache write + attention. grid.x = B * 8 (one block
+// per (b,j) kv head), block = 128 threads. Each block computes its own
+// k and v cache entries inline, so there is no cross-block dependency.
+// For each of its G=4 q heads: qk-norm, rope, fp32-dot softmax, bf16 pv.
+extern "C" __global__ void attn_mega_k(
+        const bf16* __restrict__ qkv,    // [B, 48*128]
+        const bf16* __restrict__ qn,     // [128]
+        const bf16* __restrict__ kn,     // [128]
+        const bf16* __restrict__ cosb,   // [B, 128]
+        const bf16* __restrict__ sinb,   // [B, 128]
+        bf16* __restrict__ kc,           // flat [B*8*cap,128]
+        bf16* __restrict__ vc,
+        const long long* __restrict__ pos, // [B]
+        bf16* __restrict__ out,          // [B, 32*128]
+        long long cap, float scale, float eps) {
+    int b = blockIdx.x / 8;
+    int j = blockIdx.x % 8;
+    int d = threadIdx.x;
+    long long p = pos[b];
+    const bf16* row = qkv + (long long)b * 48 * 128;
+    __shared__ float red[32];
+    __shared__ bf16 srope[128];
+
+    // ---- write this block's k and v cache entries (needed by its own
+    // attention below AND by later steps) ----
+    {
+        // v: raw copy, no norm/rope
+        const bf16* vsrc = row + (40 + j) * 128;
+        bf16 v = vsrc[d];
+        long long idx = ((long long)b * 8 + j) * cap + p;
+        vc[idx * 128 + d] = v;
+        // k: kn norm then rope
+        const bf16* ksrc = row + (32 + j) * 128;
+        float xv = bf2f(ksrc[d]);
+        float acc = xv * xv;
+        acc += __shfl_down_sync(0xffffffffu, acc, 16);
+        acc += __shfl_down_sync(0xffffffffu, acc, 8);
+        acc += __shfl_down_sync(0xffffffffu, acc, 4);
+        acc += __shfl_down_sync(0xffffffffu, acc, 2);
+        acc += __shfl_down_sync(0xffffffffu, acc, 1);
+        if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = acc;
+        __syncthreads();
+        float tot = red[0] + red[1] + red[2] + red[3];
+        float r = rsqrtf(tot / 128.f + eps);
+        bf16 t = bfmul(kn[d], f2bf(xv * r));
+        srope[d] = t;
+        __syncthreads();
+        bf16 rot = (d < 64) ? bfneg(srope[d + 64]) : srope[d - 64];
+        bf16 ke = bfadd(bfmul(t, cosb[b * 128 + d]),
+                        bfmul(rot, sinb[b * 128 + d]));
+        kc[idx * 128 + d] = ke;
+    }
+    __syncthreads();
+
+    const bf16* kbase = kc + ((long long)b * 8 + j) * cap * 128;
+    const bf16* vbase = vc + ((long long)b * 8 + j) * cap * 128;
+    // scores buffer sized (cap+pad) fp32 + (cap+pad) bf16
+    extern __shared__ float scores[];
+
+    for (int g = 0; g < 4; ++g) {
+        int h = j * 4 + g;
+        // q norm + rope into srope
+        const bf16* qsrc = row + h * 128;
+        float xv = bf2f(qsrc[d]);
+        float acc = xv * xv;
+        acc += __shfl_down_sync(0xffffffffu, acc, 16);
+        acc += __shfl_down_sync(0xffffffffu, acc, 8);
+        acc += __shfl_down_sync(0xffffffffu, acc, 4);
+        acc += __shfl_down_sync(0xffffffffu, acc, 2);
+        acc += __shfl_down_sync(0xffffffffu, acc, 1);
+        if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = acc;
+        __syncthreads();
+        float tot = red[0] + red[1] + red[2] + red[3];
+        float r = rsqrtf(tot / 128.f + eps);
+        bf16 t = bfmul(qn[d], f2bf(xv * r));
+        srope[d] = t;
+        __syncthreads();
+        bf16 rot = (d < 64) ? bfneg(srope[d + 64]) : srope[d - 64];
+        bf16 qe = bfadd(bfmul(t, cosb[b * 128 + d]),
+                        bfmul(rot, sinb[b * 128 + d]));
+        srope[d] = qe;
+        __syncthreads();
+        // score every cache row s <= p (the just-written row at s == p was
+        // committed to kc above, so kbase covers it)
+        for (int s = threadIdx.x; s <= (int)p; s += blockDim.x) {
+            const bf16* krow = kbase + (long long)s * 128;
+            float dot = 0.f;
+            for (int dd = 0; dd < 128; ++dd)
+                dot += bf2f(srope[dd]) * bf2f(krow[dd]);
+            scores[s] = dot * scale;
+        }
+        __syncthreads();
+        float mx = -3.402823466e+38f;
+        for (int s = threadIdx.x; s <= (int)p; s += blockDim.x)
+            mx = fmaxf(mx, scores[s]);
+        mx = fmaxf(mx, __shfl_down_sync(0xffffffffu, mx, 16));
+        mx = fmaxf(mx, __shfl_down_sync(0xffffffffu, mx, 8));
+        mx = fmaxf(mx, __shfl_down_sync(0xffffffffu, mx, 4));
+        mx = fmaxf(mx, __shfl_down_sync(0xffffffffu, mx, 2));
+        mx = fmaxf(mx, __shfl_down_sync(0xffffffffu, mx, 1));
+        if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = mx;
+        __syncthreads();
+        mx = fmaxf(fmaxf(red[0], red[1]), fmaxf(red[2], red[3]));
+        __shared__ float smax;
+        if (threadIdx.x == 0) smax = mx;
+        __syncthreads();
+        mx = smax;
+        for (int s = threadIdx.x; s <= (int)p; s += blockDim.x)
+            scores[s] = expf(scores[s] - mx);
+        __syncthreads();
+        float sm = 0.f;
+        for (int s = threadIdx.x; s <= (int)p; s += blockDim.x)
+            sm += scores[s];
+        sm += __shfl_down_sync(0xffffffffu, sm, 16);
+        sm += __shfl_down_sync(0xffffffffu, sm, 8);
+        sm += __shfl_down_sync(0xffffffffu, sm, 4);
+        sm += __shfl_down_sync(0xffffffffu, sm, 2);
+        sm += __shfl_down_sync(0xffffffffu, sm, 1);
+        if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sm;
+        __syncthreads();
+        sm = red[0] + red[1] + red[2] + red[3];
+        __shared__ float ssum;
+        if (threadIdx.x == 0) ssum = sm;
+        __syncthreads();
+        sm = ssum;
+        bf16* pbv = (bf16*)(scores + (p + 2));
+        for (int s = threadIdx.x; s <= (int)p; s += blockDim.x)
+            pbv[s] = f2bf(scores[s] / sm);
+        __syncthreads();
+        float accv = 0.f;
+        for (int s = 0; s <= (int)p; ++s)
+            accv += bf2f(pbv[s]) * bf2f(vbase[(long long)s * 128 + d]);
+        out[((long long)b * 32 + h) * 128 + d] = f2bf(accv);
+        __syncthreads();
+    }
+}
+"""
+
 SILU_SRC = BF16_HELPERS + r"""
 extern "C" __global__ void silu_k(const bf16* __restrict__ gu,
                                   bf16* __restrict__ out, int I) {
@@ -319,6 +458,8 @@ class RtcKernels:
                                        "rope_cache_k")
             self.attn = self.rtc.compile(ATTN_SRC, "attn", "attn_k")
             self.silu = self.rtc.compile(SILU_SRC, "silu", "silu_k")
+            self.mega = self.rtc.compile(ATTN_MEGA_SRC, "mega",
+                                       "attn_mega_k")
 
     @property
     def ok(self):
@@ -339,6 +480,14 @@ class RtcKernels:
         self.rtc.launch(self.attn, B * 32, 128, smem,
                         [ptr(qbuf), ptr(kc), ptr(vc), ptr(pos), ptr(out),
                          i64(cap), f32(1.0 / 128 ** 0.5)])
+
+    def attn_mega(self, qkv, qn, kn, cosb, sinb, kc, vc, pos, out,
+                  cap, B, maxs):
+        smem = (maxs + 8) * 6 + 64
+        self.rtc.launch(self.mega, B * 8, 128, smem,
+                        [ptr(qkv), ptr(qn), ptr(kn), ptr(cosb), ptr(sinb),
+                         ptr(kc), ptr(vc), ptr(pos), ptr(out),
+                         i64(cap), f32(1.0 / 128 ** 0.5), f32(1e-6)])
 
     def silu_mul(self, gu, out, I):
         n = gu.shape[0] * I
