@@ -544,16 +544,18 @@ class Engine:
                                      device=dev)
             st.m_amaxi = torch.empty(rk.nblk * B, dtype=torch.int32,
                                      device=dev)
-            st.m_cnt = torch.zeros(1, dtype=torch.int32, device=dev)
-            st.m_gen = torch.zeros(1, dtype=torch.int32, device=dev)
-            # host-mapped flag + up to tokcap token slots of B each
+            st.m_cnt = torch.zeros(B, dtype=torch.int32, device=dev)
+            st.m_gen = torch.zeros(B, dtype=torch.int32, device=dev)
+            # host-mapped: B per-group flag words + tokcap slots of B each
             st.m_tokcap = 512
-            st.m_map, st.m_mapdev = rk.host_map(8 + st.m_tokcap * B * 8)
+            st.m_map, st.m_mapdev = rk.host_map(
+                8 * B + st.m_tokcap * B * 8)
         rk.step_all(st.m_lw, self.embed_w, self.fin_w, st.cos, st.sin,
                     st.pos, st.cur, st.m_hid, st.m_hbuf, st.m_qkv,
                     st.m_obuf, st.m_gu, st.m_logits, st.m_amaxv,
                     st.m_amaxi, st.m_cnt, st.m_gen, st.m_mapdev,
-                    st.m_mapdev + 8, st.B, NL, ntok, EPS, st.S, bench)
+                    st.m_mapdev + 8 * B, st.B, NL, ntok, EPS, st.S,
+                    bench)
         st.m_i = getattr(st, "m_i", 0) + ntok
         self._last_logits = st.m_logits
 
@@ -1198,10 +1200,11 @@ class Engine:
                     runner()
                     ok = self._margin_ok(ref_logits, st.cur[:, 0], 1.9)
                     if name == "mega_all":
-                        # mapped-memory emit works only if the flag write
-                        # reached the host while the kernel ran
+                        # mapped-memory emit works only if every group's
+                        # flag write reached the host while the kernel ran
                         torch.cuda.synchronize()
-                        st.mega_flag = bool(st.m_map[0] > 0)
+                        st.mega_flag = bool(
+                            min(st.m_map[b] for b in range(st.B)) > 0)
                     if name == "eager_rtc":
                         self._rtc_status = 1 if ok else 2
                     if name == "eager_sdpa":
@@ -1764,9 +1767,10 @@ class Engine:
                         st.t_n += 1
                     mv = st.m_map
                     j = st.m_j = getattr(st, "m_j", 0)
-                    slot = 1 + j * B
+                    slot = B + j * B
                     _d0 = time.perf_counter()
-                    while mv[0] < j + 1:
+                    want = j + 1
+                    while min(mv[b] for b in range(B)) < want:
                         if time.perf_counter() - _d0 > 30.0:
                             raise RuntimeError("mega_flag_timeout")
                     st.t_drain += time.perf_counter() - _d0

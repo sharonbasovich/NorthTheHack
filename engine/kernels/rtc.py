@@ -530,6 +530,133 @@ __device__ void gemv(const bf16* W, const bf16* X, bf16* O,
     }
 }
 
+// group-local gemv: one sequence's row, warps gwl..gwl+nwl cover outputs
+__device__ void gemv_g(const bf16* W, const bf16* xr, bf16* O,
+                       int Od, int K, bf16* res, const bf16* gu,
+                       int fused, int gw, int gwtot) {
+    int lane = threadIdx.x & 31;
+    int K8 = K / 8;
+    if (!fused) {
+        for (int o0 = gw * 2; o0 < Od; o0 += gwtot * 2) {
+            int o1 = o0 + 1;
+            const bf16* wr0 = W + (long long)o0 * K;
+            const bf16* wr1 = o1 < Od ? W + (long long)o1 * K : wr0;
+            float acc0 = 0.f, acc1 = 0.f;
+            int k8 = lane;
+            int4 w0 = {}, x0 = {}, w1 = {}, x1 = {};
+            if (k8 < K8) {
+                w0 = *(const int4*)(wr0 + (long long)k8 * 8);
+                x0 = *(const int4*)(xr + (long long)k8 * 8);
+                w1 = *(const int4*)(wr1 + (long long)k8 * 8);
+                x1 = *(const int4*)(xr + (long long)k8 * 8);
+            }
+            for (; k8 < K8; k8 += 32) {
+                int k8n = k8 + 32;
+                int4 w0n = {}, x0n = {}, w1n = {}, x1n = {};
+                if (k8n < K8) {
+                    w0n = *(const int4*)(wr0 + (long long)k8n * 8);
+                    x0n = *(const int4*)(xr + (long long)k8n * 8);
+                    w1n = *(const int4*)(wr1 + (long long)k8n * 8);
+                    x1n = *(const int4*)(xr + (long long)k8n * 8);
+                }
+                acc0 += prod8(w0, x0); acc1 += prod8(w1, x1);
+                w0 = w0n; x0 = x0n; w1 = w1n; x1 = x1n;
+            }
+            acc0 += __shfl_down_sync(0xffffffffu, acc0, 16);
+            acc0 += __shfl_down_sync(0xffffffffu, acc0, 8);
+            acc0 += __shfl_down_sync(0xffffffffu, acc0, 4);
+            acc0 += __shfl_down_sync(0xffffffffu, acc0, 2);
+            acc0 += __shfl_down_sync(0xffffffffu, acc0, 1);
+            acc1 += __shfl_down_sync(0xffffffffu, acc1, 16);
+            acc1 += __shfl_down_sync(0xffffffffu, acc1, 8);
+            acc1 += __shfl_down_sync(0xffffffffu, acc1, 4);
+            acc1 += __shfl_down_sync(0xffffffffu, acc1, 2);
+            acc1 += __shfl_down_sync(0xffffffffu, acc1, 1);
+            if (lane == 0) {
+                O[o0] = res ? bfadd(res[o0], f2bf(acc0)) : f2bf(acc0);
+                if (o1 < Od)
+                    O[o1] = res ? bfadd(res[o1], f2bf(acc1)) : f2bf(acc1);
+            }
+        }
+        return;
+    }
+    for (int o = gw; o < Od; o += gwtot) {
+        const bf16* wr = W + (long long)o * K;
+        float acc = 0.f;
+        for (int k8 = lane; k8 < K8; k8 += 32) {
+            const int4 av = *(const int4*)(gu + (long long)k8 * 8);
+            const int4 gv = *(const int4*)(gu + K + (long long)k8 * 8);
+            const int4 wv = *(const int4*)(wr + (long long)k8 * 8);
+            const unsigned* au = (const unsigned*)&av;
+            const unsigned* gu2 = (const unsigned*)&gv;
+            const unsigned* wu = (const unsigned*)&wv;
+            for (int i = 0; i < 4; ++i) {
+                float a0 = bf2f((bf16)(au[i] & 0xffff));
+                float a1 = bf2f((bf16)(au[i] >> 16));
+                bf16 m0 = bfmul(f2bf(a0 / (1.f + expf(-a0))),
+                                f2bf(bf2f((bf16)(gu2[i] & 0xffff))));
+                bf16 m1 = bfmul(f2bf(a1 / (1.f + expf(-a1))),
+                                f2bf(bf2f((bf16)(gu2[i] >> 16))));
+                acc += bf2f((bf16)(wu[i] & 0xffff)) * bf2f(m0);
+                acc += bf2f((bf16)(wu[i] >> 16)) * bf2f(m1);
+            }
+        }
+        acc += __shfl_down_sync(0xffffffffu, acc, 16);
+        acc += __shfl_down_sync(0xffffffffu, acc, 8);
+        acc += __shfl_down_sync(0xffffffffu, acc, 4);
+        acc += __shfl_down_sync(0xffffffffu, acc, 2);
+        acc += __shfl_down_sync(0xffffffffu, acc, 1);
+        if (lane == 0) O[o] = res ? bfadd(res[o], f2bf(acc)) : f2bf(acc);
+    }
+}
+
+// group-local lm head: float logits out for one sequence
+__device__ void gemv_gf(const bf16* W, const bf16* xr, float* O,
+                        int Od, int K, int gw, int gwtot) {
+    int lane = threadIdx.x & 31;
+    int K8 = K / 8;
+    for (int o0 = gw * 2; o0 < Od; o0 += gwtot * 2) {
+        int o1 = o0 + 1;
+        const bf16* wr0 = W + (long long)o0 * K;
+        const bf16* wr1 = o1 < Od ? W + (long long)o1 * K : wr0;
+        float acc0 = 0.f, acc1 = 0.f;
+        int k8 = lane;
+        int4 w0 = {}, x0 = {}, w1 = {}, x1 = {};
+        if (k8 < K8) {
+            w0 = *(const int4*)(wr0 + (long long)k8 * 8);
+            x0 = *(const int4*)(xr + (long long)k8 * 8);
+            w1 = *(const int4*)(wr1 + (long long)k8 * 8);
+            x1 = *(const int4*)(xr + (long long)k8 * 8);
+        }
+        for (; k8 < K8; k8 += 32) {
+            int k8n = k8 + 32;
+            int4 w0n = {}, x0n = {}, w1n = {}, x1n = {};
+            if (k8n < K8) {
+                w0n = *(const int4*)(wr0 + (long long)k8n * 8);
+                x0n = *(const int4*)(xr + (long long)k8n * 8);
+                w1n = *(const int4*)(wr1 + (long long)k8n * 8);
+                x1n = *(const int4*)(xr + (long long)k8n * 8);
+            }
+            acc0 += prod8(w0, x0); acc1 += prod8(w1, x1);
+            w0 = w0n; x0 = x0n; w1 = w1n; x1 = x1n;
+        }
+        acc0 += __shfl_down_sync(0xffffffffu, acc0, 16);
+        acc0 += __shfl_down_sync(0xffffffffu, acc0, 8);
+        acc0 += __shfl_down_sync(0xffffffffu, acc0, 4);
+        acc0 += __shfl_down_sync(0xffffffffu, acc0, 2);
+        acc0 += __shfl_down_sync(0xffffffffu, acc0, 1);
+        acc1 += __shfl_down_sync(0xffffffffu, acc1, 16);
+        acc1 += __shfl_down_sync(0xffffffffu, acc1, 8);
+        acc1 += __shfl_down_sync(0xffffffffu, acc1, 4);
+        acc1 += __shfl_down_sync(0xffffffffu, acc1, 2);
+        acc1 += __shfl_down_sync(0xffffffffu, acc1, 1);
+        if (lane == 0) {
+            O[o0] = acc0;
+            if (o1 < Od) O[o1] = acc1;
+        }
+    }
+}
+
 // float-output variant for the lm head
 __device__ void gemv_f(const bf16* W, const bf16* X, float* O,
                        int B, int Od, int K) {
@@ -710,6 +837,7 @@ extern "C" __global__ void step_all_k(
         volatile long long* __restrict__ tokm,   // host-mapped [O*B]
         int B, int NL, int ntok, float eps, long long cap, int bench) {
     int blk = blockIdx.x, tid = threadIdx.x;
+    (void)tid;
     int nblk = gridDim.x;
     __shared__ float red[NT / 32];
     __shared__ bf16 srope[128];
@@ -720,25 +848,40 @@ extern "C" __global__ void step_all_k(
     bf16* h = hbuf;
     bf16* h2 = hbuf + (long long)B * HDIM;
     int per = nblk / B;
+    // batch-row block groups: block blk owns row b = blk/per at slot
+    // loc = blk%per. Rows never interact — barriers are group-local
+    // (cnt[b]/gen[b]), shrinking each barrier from 131 to per blocks.
+    int b = blk / per;
+    int loc = blk % per;
+    if (blk >= B * per) return;   // spare blocks sit out entirely
+
+    unsigned* gcnt = cnt + b;
+    volatile unsigned* ggen = gen + b;
+    int nwl = per * (NT / 32);
+    int gwl = loc * (NT / 32) + (tid >> 5);
 
     if (bench) {
-        // barriers-only probe: same gbar count as a full step, no compute
         for (int s = 0; s < ntok; ++s) {
-            for (int i = 0; i < NL * 6 + 4; ++i) gbar(cnt, gen);
-            if (blk == 0 && tid == 0) flag[0] = (long long)(s + 1);
+            for (int i = 0; i < NL * 6 + 4; ++i) gbar(gcnt, ggen);
+            if (loc == 0 && tid == 0) flag[b] = (long long)(s + 1);
         }
         return;
     }
 
+    bf16* hidb = hid + (long long)b * HDIM;
+    bf16* qkvb = qkv + (long long)b * QKVD;
+    bf16* obufb = obuf + (long long)b * ODIM;
+    bf16* gub  = gu + (long long)b * 2 * IDIM;
+    float* logb = logits + (long long)b * VDIM;
+
     for (int step_i = 0; step_i < ntok; ++step_i) {
     // embed current token into residual stream
-    if (blk < B) {
-        long long tok = cur[blk];
+    if (loc == 0) {
+        long long tok = cur[b];
         const bf16* e = embed + tok * (long long)HDIM;
-        bf16* o = hid + (long long)blk * HDIM;
-        for (int i = tid; i < HDIM; i += NT) o[i] = e[i];
+        for (int i = tid; i < HDIM; i += NT) hidb[i] = e[i];
     }
-    gbar(cnt, gen);
+    gbar(gcnt, ggen);
 
     for (int l = 0; l < NL; ++l) {
         const bf16* w_ln_in = (const bf16*)lw[l * 10 + 0];
@@ -749,51 +892,51 @@ extern "C" __global__ void step_all_k(
         const bf16* w_ln2   = (const bf16*)lw[l * 10 + 5];
         const bf16* wgu     = (const bf16*)lw[l * 10 + 6];
         const bf16* wd      = (const bf16*)lw[l * 10 + 7];
-        bf16* kc            = (bf16*)lw[l * 10 + 8];
-        bf16* vc            = (bf16*)lw[l * 10 + 9];
+        bf16* kcb           = (bf16*)lw[l * 10 + 8];
+        bf16* vcb           = (bf16*)lw[l * 10 + 9];
 
-        if (blk < B) rms_row(hid + (long long)blk * HDIM, w_ln_in,
-                             h + (long long)blk * HDIM, eps, red);
-        gbar(cnt, gen);
-        gemv(wqkv, h, qkv, B, QKVD, HDIM, 0, 0, 0);
-        gbar(cnt, gen);
-        if (blk < B * 8) {
-            int b = blk / 8, j = blk % 8;
-            attn_unit(b, j, qkv + (long long)b * QKVD, wqn, wkn,
-                      cost, sint, kc, vc, pos[b],
-                      obuf, cap, 1.0f / 11.313708499f, eps,
+        if (loc == 0) rms_row(hidb, w_ln_in, h + (long long)b * HDIM,
+                              eps, red);
+        gbar(gcnt, ggen);
+        gemv_g(wqkv, h + (long long)b * HDIM, qkvb, QKVD, HDIM, 0, 0,
+               0, gwl, nwl);
+        gbar(gcnt, ggen);
+        if (loc < 8) {
+            attn_unit(b, loc, qkvb, wqn, wkn,
+                      cost, sint, kcb, vcb, pos[b],
+                      obufb, cap, 1.0f / 11.313708499f, eps,
                       red, srope, scores);
         }
-        gbar(cnt, gen);
-        gemv(wo, obuf, hid, B, HDIM, ODIM, hid, 0, 0);
-        gbar(cnt, gen);
-        if (blk < B) rms_row(hid + (long long)blk * HDIM, w_ln2,
-                             h2 + (long long)blk * HDIM, eps, red);
-        gbar(cnt, gen);
-        gemv(wgu, h2, gu, B, GDIM, HDIM, 0, 0, 0);
-        gbar(cnt, gen);
-        gemv(wd, 0, hid, B, HDIM, IDIM, hid, gu, 1);
-        gbar(cnt, gen);
+        gbar(gcnt, ggen);
+        gemv_g(wo, obufb, hidb, HDIM, ODIM, hidb, 0, 0, gwl, nwl);
+        gbar(gcnt, ggen);
+        if (loc == 0) rms_row(hidb, w_ln2, h2 + (long long)b * HDIM,
+                              eps, red);
+        gbar(gcnt, ggen);
+        gemv_g(wgu, h2 + (long long)b * HDIM, gub, GDIM, HDIM, 0, 0,
+               0, gwl, nwl);
+        gbar(gcnt, ggen);
+        gemv_g(wd, 0, hidb, HDIM, IDIM, hidb, gub, 1, gwl, nwl);
+        gbar(gcnt, ggen);
     }
 
-    if (blk < B) rms_row(hid + (long long)blk * HDIM, finw,
-                         h + (long long)blk * HDIM, eps, red);
-    gbar(cnt, gen);
-    gemv_f(embed, h, logits, B, VDIM, HDIM);
-    gbar(cnt, gen);
+    if (loc == 0) rms_row(hidb, finw, h + (long long)b * HDIM, eps,
+                          red);
+    gbar(gcnt, ggen);
+    gemv_gf(embed, h + (long long)b * HDIM, logb, VDIM, HDIM,
+            gwl, nwl);
+    gbar(gcnt, ggen);
 
-    // argmax over logits[b, :VDIM]. Block slice s of row b scans
-    // [s*VDIM/per, (s+1)*VDIM/per); per-block winner goes to scratch,
-    // then blocks 0..B-1 reduce their row's slice winners.
-    if (blk < B * per) {
-        int b = blk % B, s = blk / B;
+    // argmax over logits[b]: group-local slice scan, scratch reduce,
+    // loc==0 reduces slice winners.
+    {
+        int s = loc;
         int lo = (int)(((long long)s * VDIM) / per);
         int hi = (int)(((long long)(s + 1) * VDIM) / per);
-        const float* lg = logits + (long long)b * VDIM;
         float mv = -3.402823466e+38f;
         int mi = lo;
         for (int i = lo + tid; i < hi; i += NT) {
-            float v = lg[i];
+            float v = logb[i];
             if (v > mv || (v == mv && i < mi)) { mv = v; mi = i; }
         }
         for (int off = 16; off > 0; off >>= 1) {
@@ -811,25 +954,28 @@ extern "C" __global__ void step_all_k(
                 int oi = __shfl_down_sync(0xffffffffu, mi, off);
                 if (ov > mv || (ov == mv && oi < mi)) { mv = ov; mi = oi; }
             }
-            if (tid == 0) { amaxv[blk] = mv; amaxi[blk] = mi; }
+            if (tid == 0) {
+                amaxv[s * B + b] = mv;
+                amaxi[s * B + b] = mi;
+            }
         }
     }
-    gbar(cnt, gen);
-    if (blk < B && tid == 0) {
+    gbar(gcnt, ggen);
+    if (loc == 0 && tid == 0) {
         float mv = -3.402823466e+38f;
         int mi = VDIM;
         for (int s = 0; s < per; ++s) {
-            float v = amaxv[s * B + blk];
-            int i = amaxi[s * B + blk];
+            float v = amaxv[s * B + b];
+            int i = amaxi[s * B + b];
             if (v > mv || (v == mv && i < mi)) { mv = v; mi = i; }
         }
-        cur[blk] = (long long)mi;
-        tokm[(long long)step_i * B + blk] = (long long)mi;
-        pos[blk] += 1;
+        cur[b] = (long long)mi;
+        tokm[(long long)step_i * B + b] = (long long)mi;
+        pos[b] += 1;
         __threadfence_system();
     }
-    gbar(cnt, gen);
-    if (blk == 0 && tid == 0) flag[0] = (long long)(step_i + 1);
+    gbar(gcnt, ggen);
+    if (loc == 0 && tid == 0) flag[b] = (long long)(step_i + 1);
     }
 }
 """
