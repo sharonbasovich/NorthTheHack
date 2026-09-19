@@ -901,6 +901,14 @@ class Engine:
         except Exception:
             self._batch_err = step
 
+    def _decode_step_slow_ret(self, st):
+        self._decode_step_slow(st)
+        return st.cur
+
+    def _decode_step_slow_batch_ret(self, st):
+        self._decode_step_slow_batch(st)
+        return st.emit_dev
+
     def _choose(self, st: _State, L: int, first: torch.Tensor,
                 ids: torch.Tensor) -> None:
         """Benchmark every decode-path variant on live state; keep the fastest
@@ -940,14 +948,6 @@ class Engine:
         st.decode_name = 0
         restore()
         self._choose_path = 4
-
-    def _decode_step_slow_ret(self, st):
-        self._decode_step_slow(st)
-        return st.cur
-
-    def _decode_step_slow_batch_ret(self, st):
-        self._decode_step_slow_batch(st)
-        return st.emit_dev
 
         candidates = []
         if self._probe("toolchain"):
@@ -1172,15 +1172,15 @@ class Engine:
         path = getattr(self, "_choose_path", 0) & 7
         err = getattr(self, "_batch_err", 0) & 7
         if st.B == 1:
-            V = dec | (spc << 4) | (path << 8) | (err << 11)
+            Vd = dec | (spc << 4) | (path << 8) | (err << 11)
         elif st.B == 4:
-            V = probes_mask | (extc << 4) | (path << 8)
+            Vd = probes_mask | (extc << 4) | (path << 8)
         elif st.B == 16:
-            V = (flags | (min(15, int(getattr(st, "decode_ms", 0))) << 4)
+            Vd = (flags | (min(15, int(getattr(st, "decode_ms", 0))) << 4)
                  | (path << 8))
         else:
-            V = dec | (spc << 4) | (path << 8)
-        st.diag_v = min(V, 16383)
+            Vd = dec | (spc << 4) | (path << 8)
+        st.diag_v = min(Vd, 16383)
         st.diag_i = -1   # -1 marks the warmup generation
 
         # whole-prefill graph: replays identical work per call, verified
