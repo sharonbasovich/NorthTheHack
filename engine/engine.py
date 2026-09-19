@@ -1123,16 +1123,21 @@ class Engine:
         except Exception:
             pass
         st.spec_cooldown = 0
-        if DIAG_BOOM:
-            print("KR_FULL B=%d dec=%s spec=%s berr=%s bexc=%s probes=%s "
-                  "slow_only=%s jit_ok=%s" % (
-                      st.B, getattr(st, "decode_name", None),
-                      getattr(st, "spec_name", None),
-                      getattr(self, "_batch_err", None),
-                      getattr(self, "_batch_exc", None),
-                      self._probes, self._step_slow_only,
-                      getattr(self, "_jit_ok", None)), flush=True)
-            raise RuntimeError("KR_SUICIDE diagnostics")
+        if DIAG_BOOM and st.B == 1:
+            # die on the first public workload with diagnostics packed into
+            # the exception — the run reports caseMessage even when stdout
+            # is muted.
+            raise RuntimeError(
+                "KR_DIAG dec=%s spc=%s berr=%s bexc=%s probes=%s "
+                "slow_only=%s jitok=%s dms=%.1f sms=%.1f" % (
+                    getattr(st, "decode_name", None),
+                    getattr(st, "spec_name", None),
+                    getattr(self, "_batch_err", None),
+                    getattr(self, "_batch_exc", None),
+                    self._probes, self._step_slow_only,
+                    getattr(self, "_jit_ok", None),
+                    getattr(st, "decode_ms", -1),
+                    getattr(st, "spec_ms", -1)))
         # telemetry: hidden-case stdout is muted, but each public workload
         # reports peakMemoryBytes. Sample-0 allocates V * 8MB transiently,
         # encoding two nibbles readable as (peak - base) / 8MB. The warmup
