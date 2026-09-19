@@ -617,6 +617,15 @@ class Engine:
             step(st)
         return g
 
+    @staticmethod
+    def _drain(pin, sentinel=-1):
+        # Spin until a pending non_blocking D2H copy lands in `pin`.
+        # cudaDeviceSynchronize costs ~ms under gVisor (trapped ioctl);
+        # polling pinned host memory is a plain read. Fill with sentinel
+        # before enqueueing the copy.
+        while bool((pin == sentinel).any()):
+            pass
+
     def _bench(self, fn, iters: int = 3) -> float:
         """ms/call wall-clock for fn(), whatever it does internally."""
         try:
@@ -793,8 +802,9 @@ class Engine:
         st.inp_pin.copy_(torch.tensor(rows, dtype=torch.int64))
         st.inp.copy_(st.inp_pin, non_blocking=True)
         st.spec_runner()
+        st.emit_pin.fill_(-1)
         st.emit_pin.copy_(st.emit_dev, non_blocking=True)
-        torch.cuda.synchronize()
+        self._drain(st.emit_pin)
         ep = st.emit_pin.tolist()
         tot = 0
         for b in range(B):
@@ -1393,12 +1403,12 @@ class Engine:
                 else:
                     if st.spec_cooldown:
                         st.spec_cooldown -= 1
-                    for b in range(B):
-                        st.cur_pin[b] = queues[b][-1]
-                    st.cur[:, 0].copy_(st.cur_pin, non_blocking=True)
+                    # st.cur already holds the last emitted token (written
+                    # on-device by the previous step) — no H2D needed.
                     st.decode_runner()
+                    st.pin.fill_(-1)
                     st.pin.copy_(st.cur[:, 0], non_blocking=True)
-                    torch.cuda.synchronize()
+                    self._drain(st.pin)
                     toks = st.pin.tolist()
                     for b in range(B):
                         queues[b].append(toks[b])
