@@ -338,6 +338,7 @@ class Engine:
         self.states = {}
         self._probes = {}
         self._hist_cache = {}   # prompt-keyed _Ngram templates, cross-sample
+        self._rtk = None      # lazy RtcKernels (NVRTC) — None=untried, False=failed
         self._ext = None       # compiled C++ decode-step module
         self._ext_tried = False
         self._t0 = time.time()   # engine creation; guards warmup budget
@@ -440,6 +441,41 @@ class Engine:
             gu = h2 @ w["wgu"].t()
             m = F.silu(gu[:, :I]) * gu[:, I:]
             x = torch.addmm(x.view(B, H), m, w["wd"].t()).view(B, 1, H)
+        x = _rms(x, self.fin_w)
+        logits = x.view(B, H) @ self.lm_w.t()
+        self._last_logits = logits
+        tok = logits.argmax(dim=-1)
+        st.cur.copy_(tok.view(B, 1))
+        st.pos.add_(1)
+
+    def _decode_step_rtc(self, st: _State) -> None:
+        """Decode step on NVRTC-compiled fused kernels: ~9 CUDA launches
+        per layer instead of ~30. Numerics replicated exactly (see
+        kernels/rtc.py header)."""
+        B = st.B
+        rk = self._rtk
+        if getattr(st, "qbuf", None) is None:
+            st.qbuf = torch.empty(B, NQ * D, dtype=torch.bfloat16,
+                                  device=self.dev)
+            st.obuf = torch.empty(B, NQ * D, dtype=torch.bfloat16,
+                                  device=self.dev)
+        x = F.embedding(st.cur, self.embed_w)
+        cosb = st.cos.index_select(0, st.pos)
+        sinb = st.sin.index_select(0, st.pos)
+        for i, w in enumerate(self.layers):
+            rk.rms_norm(x.view(B, H), w["ln_in"], st.h[:B], H, EPS)
+            qkv = st.h[:B] @ w["wqkv"].t()
+            rk.rope_cache(qkv, w["qn"], w["kn"], cosb, sinb, st.qbuf,
+                          st.kc[i], st.vc[i], st.pos, st.S, B)
+            rk.attn(st.qbuf, st.kc[i], st.vc[i], st.pos, st.obuf,
+                    st.S, B, st.S)
+            x = torch.addmm(x.view(B, H), st.obuf, w["wo"].t()) \
+                .view(B, 1, H)
+            rk.rms_norm(x.view(B, H), w["ln_post"], st.h2[:B], H, EPS)
+            gu = st.h2[:B] @ w["wgu"].t()
+            rk.silu_mul(gu, st.mlp[:B], I)
+            x = torch.addmm(x.view(B, H), st.mlp[:B], w["wd"].t()) \
+                .view(B, 1, H)
         x = _rms(x, self.fin_w)
         logits = x.view(B, H) @ self.lm_w.t()
         self._last_logits = logits
@@ -1024,6 +1060,15 @@ class Engine:
         candidates.append(("graph_slow", self._decode_step_slow))
         if _HAS_TRITON and not self._step_slow_only:
             candidates.append(("graph_fast", self._decode_step_fast))
+        if self._rtk is None:
+            try:
+                from kernels.rtc import RtcKernels
+                self._rtk = RtcKernels()
+            except Exception:
+                self._rtk = False
+        if self._rtk:
+            candidates.append(("eager_rtc",
+                               lambda s=st: self._decode_step_rtc(s)))
         candidates.append(("eager_sdpa",
                            lambda s=st: self._decode_step_sdpa(s)))
         if self._probe("toolchain"):
@@ -1121,7 +1166,7 @@ class Engine:
                     st.decode_name = {
                         "eager_fast": 1, "graph_slow": 2, "graph_fast": 3,
                         "jit": 4, "compile": 5, "ext": 6, "eager_rms": 7,
-                        "eager_sdpa": 5,
+                        "eager_sdpa": 5, "eager_rtc": 3,
                     }[name]
                     if name == "graph_slow":
                         self._gerr = 1
