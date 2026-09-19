@@ -48,7 +48,7 @@ V = 151936
 K_DRAFT = 8          # draft tokens per verify pass
 R = K_DRAFT + 1      # rows per sequence in the verify pass
 NGRAM_SIZES = (6, 5, 4, 3, 2)
-DIAG_BOOM = True     # sacrificial run: print internals then raise (stdout leak)
+DIAG_BOOM = False    # sacrificial run: print internals then raise (stdout leak)
 
 
 def _rms(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -911,6 +911,7 @@ class Engine:
         six workloads' choosing can't exceed the run's 15-minute limit.
         """
         choose_t0 = time.time()
+        self._choose_path = 1   # progress marker for telemetry
 
         def over_budget() -> bool:
             return time.time() - choose_t0 > 40.0
@@ -923,7 +924,9 @@ class Engine:
             st.pos.copy_(p0)
 
         # fused-vs-torch parity gate
+        self._choose_path = 2
         self._self_check(st)
+        self._choose_path = 3
         restore()
 
         # reference token and logits from the always-correct slow step
@@ -936,6 +939,7 @@ class Engine:
         st.decode_ms = self._bench(st.decode_runner)
         st.decode_name = 0
         restore()
+        self._choose_path = 4
 
         candidates = []
         if self._probe("toolchain"):
@@ -1016,6 +1020,7 @@ class Engine:
 
         # spec-verify pass: pure-torch batch verify is provably correct;
         # fused variants must reproduce its full emit grid on junk inputs.
+        self._choose_path = 5
         st.spec_runner = None
         st.spec_ms = float("inf")
         st.inp.fill_(0)
@@ -1109,6 +1114,7 @@ class Engine:
                     restore()
         st.spec_enabled = st.spec_runner is not None
         st.spec_window = []
+        self._choose_path = 6
         try:
             print(
                 "KR_DIAG decode=%d(%.1fms) ext=%s spec=%d(%.1fms) "
@@ -1154,15 +1160,18 @@ class Engine:
         dec = getattr(st, "decode_name", 0) & 15
         spc = getattr(st, "spec_name", 0) & 15
         extc = getattr(self, "_ext_code", 0) & 15
+        path = getattr(self, "_choose_path", 0) & 7
         if st.B == 1:
-            V = dec | (spc << 4) | ((getattr(self, "_batch_err", 0) & 15) << 8)
+            V = (dec | (spc << 4) | ((getattr(self, "_batch_err", 0) & 7) << 8)
+                 | (path << 11))
         elif st.B == 4:
-            V = probes_mask | (extc << 4)
+            V = probes_mask | (extc << 4) | (path << 8)
         elif st.B == 16:
-            V = flags | (min(15, int(getattr(st, "decode_ms", 0))) << 4)
+            V = (flags | (min(15, int(getattr(st, "decode_ms", 0))) << 4)
+                 | (path << 8))
         else:
-            V = dec | (spc << 4)
-        st.diag_v = min(V, 4095)
+            V = dec | (spc << 4) | (path << 8)
+        st.diag_v = min(V, 16383)
         st.diag_i = -1   # -1 marks the warmup generation
 
         # whole-prefill graph: replays identical work per call, verified
