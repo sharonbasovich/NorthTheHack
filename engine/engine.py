@@ -419,6 +419,7 @@ class Engine:
         cos = st.cos.index_select(0, st.pos).view(B, 1, 1, D)
         sin = st.sin.index_select(0, st.pos).view(B, 1, 1, D)
         amask = (st.srange[None, :] <= st.pos[:, None]).view(B, 1, 1, st.S)
+        _fl = st.kw1 + st.pos.view(B, 1).expand(B, NKV).reshape(-1)
         for i, w in enumerate(self.layers):
             h = rms_norm(x.view(B, H), (H,), w["ln_in"], EPS)
             qkv = h @ w["wqkv"].t()
@@ -428,7 +429,6 @@ class Engine:
             qke = qkn * cos + _rot_half(qkn) * sin
             qe = qke[:, :, :NQ]
             ke = qke[:, :, NQ:]
-            _fl = st.kw1 + st.pos.view(B, 1).expand(B, NKV).reshape(-1)
             st.kc[i].view(-1, D).index_copy_(0, _fl, ke.reshape(-1, D))
             st.vc[i].view(-1, D).index_copy_(0, _fl, v.reshape(-1, D))
             o = F.scaled_dot_product_attention(
@@ -456,6 +456,7 @@ class Engine:
         cos = st.cos.index_select(0, st.pos).view(B, 1, 1, D)
         sin = st.sin.index_select(0, st.pos).view(B, 1, 1, D)
         nvalid = st.srange[None, :] > st.pos[:, None]
+        _fl = st.kw1 + st.pos.view(B, 1).expand(B, NKV).reshape(-1)
         for i, w in enumerate(self.layers):
             h = _rms(x, w["ln_in"]).view(B, H)
             qkv = h @ w["wqkv"].t()
@@ -465,7 +466,6 @@ class Engine:
             qke = qkn * cos + _rot_half(qkn) * sin
             qe = qke[:, :, :NQ]
             ke = qke[:, :, NQ:]
-            _fl = st.kw1 + st.pos.view(B, 1).expand(B, NKV).reshape(-1)
             st.kc[i].view(-1, D).index_copy_(0, _fl, ke.reshape(-1, D))
             st.vc[i].view(-1, D).index_copy_(0, _fl, v.reshape(-1, D))
             qg = qe.reshape(B, NKV, GROUP, D)
@@ -659,16 +659,23 @@ class Engine:
         except Exception:
             self._step_slow_only = True
 
-    def _capture(self, st: _State, step, iters: int) -> torch.cuda.CUDAGraph:
+    def _capture(self, st: _State, step, iters: int,
+                 mode: str = "global") -> torch.cuda.CUDAGraph:
         s = torch.cuda.Stream()
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
             for _ in range(iters):
                 step(st)
         torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
         g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            step(st)
+        try:
+            with torch.cuda.graph(g, capture_error_mode=mode):
+                step(st)
+        except TypeError:
+            # older signature without capture_error_mode
+            with torch.cuda.graph(g):
+                step(st)
         return g
 
     @staticmethod
@@ -1055,7 +1062,18 @@ class Engine:
                     restore()
                 elif name.startswith("graph"):
                     try:
-                        g = self._capture(st, what, 1)
+                        g = None
+                        for _mode in ("thread_local", "relaxed", "global"):
+                            try:
+                                g = self._capture(st, what, 1, mode=_mode)
+                                self._gmode = {"thread_local": 1,
+                                               "relaxed": 2,
+                                               "global": 3}[_mode]
+                                break
+                            except Exception:
+                                continue
+                        if g is None:
+                            raise RuntimeError("all capture modes failed")
                         restore()
                         g.replay()
                         ok = self._margin_ok(ref_logits, st.cur[:, 0], 1.9)
@@ -1297,11 +1315,9 @@ class Engine:
         st.diag_i = -1   # -1 marks the warmup generation
 
         # whole-prefill graph: replays identical work per call, verified
-        # against the eager prefill's argmax before use.
-        if not self._probe("graph"):
-            st.pre_graph = None
-            st.best = True
-            return
+        # against the eager prefill's argmax before use. Attempted
+        # unconditionally — the probe has been flaky under gVisor; a real
+        # capture attempt costs only the exception if it fails.
         try:
             st.ids_dev.copy_(ids)
             s = torch.cuda.Stream()
@@ -1309,13 +1325,25 @@ class Engine:
             with torch.cuda.stream(s):
                 self._prefill_capturable(st)
             torch.cuda.current_stream().wait_stream(s)
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g):
-                self._prefill_capturable(st)
-            g.replay()
-            torch.cuda.synchronize()
-            if torch.equal(st.first_dev, first):
-                st.pre_graph = g
+            g = None
+            for _mode in ("thread_local", "relaxed", "global"):
+                try:
+                    g = torch.cuda.CUDAGraph()
+                    try:
+                        with torch.cuda.graph(g, capture_error_mode=_mode):
+                            self._prefill_capturable(st)
+                    except TypeError:
+                        with torch.cuda.graph(g):
+                            self._prefill_capturable(st)
+                    break
+                except Exception:
+                    g = None
+                    continue
+            if g is not None:
+                g.replay()
+                torch.cuda.synchronize()
+                if torch.equal(st.first_dev, first):
+                    st.pre_graph = g
         except Exception:
             st.pre_graph = None
         st.best = True
@@ -1357,7 +1385,8 @@ class Engine:
             emitenc = 7
         if st.B == 1:
             Vd = (dec | (emitenc << 4) | ((getattr(self, "_gexc", 0)) << 7)
-                  | (((err or _opcost)) << 10))
+                  | ((getattr(self, "_gmode", 0) & 3) << 10)
+                  | (((err or _opcost) & 3) << 12))
         elif st.B == 4:
             Vd = (probes_mask | (dec << 4) | (emitenc << 8)
                   | ((getattr(self, "_gerr", 0) & 7) << 11))
