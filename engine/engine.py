@@ -924,7 +924,7 @@ class Engine:
         self._choose_path = 1   # progress marker for telemetry
 
         def over_budget() -> bool:
-            return time.time() - choose_t0 > 40.0
+            return time.time() - choose_t0 > 110.0
 
         c0 = st.cur.clone()
         p0 = st.pos.clone()
@@ -966,6 +966,8 @@ class Engine:
             candidates.append(("eager_rms", lambda s=st: self._decode_step_rms(s)))
         # jit only as a fallback: tracing ~1300 ops costs ~10-60s per call,
         # so skip it entirely when the C++ ext loaded (it strictly dominates).
+        if self._probe("compile"):
+            candidates.append(("compile", "compile"))
         if self._ext is None and self._probe("jit"):
             candidates.append(("jit", "jit"))
         self._cand_mask = 0
@@ -993,12 +995,19 @@ class Engine:
                     ok = self._margin_ok(ref_logits, st.cur[:, 0], 1.9)
                     restore()
                 elif name.startswith("graph"):
-                    g = self._capture(st, what, 1)
-                    restore()
-                    g.replay()
-                    ok = self._margin_ok(ref_logits, st.cur[:, 0], 1.9)
-                    restore()
-                    runner = g.replay
+                    try:
+                        g = self._capture(st, what, 1)
+                        restore()
+                        g.replay()
+                        ok = self._margin_ok(ref_logits, st.cur[:, 0], 1.9)
+                        restore()
+                        runner = g.replay
+                        if name == "graph_slow":
+                            self._gerr = 2 if not ok else 0
+                    except Exception:
+                        if name == "graph_slow":
+                            self._gerr = 3
+                        raise
                 elif name == "jit":
                     disarm = self._watchdog(30)
                     try:
@@ -1011,9 +1020,14 @@ class Engine:
                     restore()
                     runner = traced
                 elif name == "compile":
-                    comp = torch.compile(
-                        lambda: self._decode_step_slow(st), fullgraph=False)
-                    comp()
+                    disarm = self._watchdog(100)
+                    try:
+                        comp = torch.compile(
+                            lambda: self._decode_step_slow_ret(st),
+                            (), fullgraph=False)
+                        comp()
+                    finally:
+                        disarm()
                     ok = self._margin_ok(ref_logits, st.cur[:, 0], 1.9)
                     restore()
                     runner = comp
@@ -1025,6 +1039,8 @@ class Engine:
                     "compile": 6}.get(name, 6)
                 ms = self._bench(runner)
                 restore()
+                if name == "graph_slow" and not (ms < st.decode_ms):
+                    self._gerr = 4
                 if ms < st.decode_ms:
                     st.decode_ms = ms
                     st.decode_runner = runner
@@ -1032,6 +1048,8 @@ class Engine:
                         "eager_fast": 1, "graph_slow": 2, "graph_fast": 3,
                         "jit": 4, "compile": 5, "ext": 6, "eager_rms": 7,
                     }[name]
+                    if name == "graph_slow":
+                        self._gerr = 1
                     if name == "jit":
                         self._jit_ok = True
                 else:
@@ -1222,10 +1240,21 @@ class Engine:
         dec = getattr(st, "decode_name", 0) & 15
         spc = getattr(st, "spec_name", 0) & 15
         extc = getattr(self, "_ext_code", 0) & 15
+        # dispatch-cost micro-probe: ms for 200 tiny in-place ops incl sync
+        try:
+            _t = st.cur
+            torch.cuda.synchronize()
+            _t0 = time.time()
+            for _ in range(200):
+                _t.add_(0)
+            torch.cuda.synchronize()
+            _opcost = int(min(7, (time.time() - _t0) * 5))  # ~ms/op scale
+        except Exception:
+            _opcost = 0
         path = getattr(self, "_choose_path", 0) & 7
         err = getattr(self, "_batch_err", 0) & 7
         if st.B == 1:
-            Vd = dec | (spc << 4) | (path << 8) | (err << 11)
+            Vd = dec | (spc << 4) | (path << 8) | (((err or _opcost)) << 11)
         elif st.B == 4:
             Vd = (probes_mask | (dec << 4)
                   | ((getattr(self, "_cand_tried", 0) & 63) << 8))
@@ -1233,7 +1262,8 @@ class Engine:
             _dms = getattr(st, "decode_ms", 0)
             if not (_dms < 1e9):
                 _dms = 0
-            Vd = (flags | (min(15, int(_dms)) << 4) | (path << 8))
+            Vd = (flags | (min(15, int(_dms)) << 4) | (path << 8)
+                  | ((getattr(self, "_gerr", 0) & 7) << 11))
         else:
             Vd = dec | (spc << 4) | (path << 8)
         st.diag_v = min(Vd, 16383)
