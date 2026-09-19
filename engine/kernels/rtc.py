@@ -373,10 +373,25 @@ __device__ __forceinline__ void gbar(unsigned* cnt, volatile unsigned* gen) {
             __threadfence();
             atomicExch((unsigned*)gen, g + 1);
         } else {
-            while (*gen == g) { }
+            while (*gen == g) __nanosleep(64);
         }
     }
     __syncthreads();
+}
+
+__device__ __forceinline__ float dot8(const bf16* w, const bf16* x,
+                                      int k8) {
+    // 8 bf16 pairs starting at element k8*8 — two 16B loads
+    const int4 wv = *(const int4*)(w + (long long)k8 * 8);
+    const int4 xv = *(const int4*)(x + (long long)k8 * 8);
+    const unsigned* wu = (const unsigned*)&wv;
+    const unsigned* xu = (const unsigned*)&xv;
+    float acc = 0.f;
+    for (int i = 0; i < 4; ++i) {
+        acc += bf2f((bf16)(wu[i] & 0xffff)) * bf2f((bf16)(xu[i] & 0xffff));
+        acc += bf2f((bf16)(wu[i] >> 16)) * bf2f((bf16)(xu[i] >> 16));
+    }
+    return acc;
 }
 
 // one block reduces one row: bf16 x in, rms -> bf16 out (w bf16-mul)
@@ -417,16 +432,28 @@ __device__ void gemv(const bf16* W, const bf16* X, bf16* O,
                                : (X + (long long)b * K);
         const bf16* wr = W + (long long)i * K;
         float acc = 0.f;
-        for (int k = lane; k < K; k += 32) {
-            bf16 xv;
+        for (int k8 = lane; k8 < K / 8; k8 += 32) {
             if (fused) {
-                float a = bf2f(xr[k]);
-                float g = bf2f(xr[K + k]);
-                xv = bfmul(f2bf(a / (1.f + expf(-a))), f2bf(g));
+                // silu(x) * u on the fly, 8 lanes of work at once
+                const int4 av = *(const int4*)(xr + (long long)k8 * 8);
+                const int4 gv = *(const int4*)(xr + K + (long long)k8 * 8);
+                const int4 wv = *(const int4*)(wr + (long long)k8 * 8);
+                const unsigned* au = (const unsigned*)&av;
+                const unsigned* gu2 = (const unsigned*)&gv;
+                const unsigned* wu = (const unsigned*)&wv;
+                for (int i = 0; i < 4; ++i) {
+                    float a0 = bf2f((bf16)(au[i] & 0xffff));
+                    float a1 = bf2f((bf16)(au[i] >> 16));
+                    bf16 m0 = bfmul(f2bf(a0 / (1.f + expf(-a0))),
+                                    f2bf(bf2f((bf16)(gu2[i] & 0xffff))));
+                    bf16 m1 = bfmul(f2bf(a1 / (1.f + expf(-a1))),
+                                    f2bf(bf2f((bf16)(gu2[i] >> 16))));
+                    acc += bf2f((bf16)(wu[i] & 0xffff)) * bf2f(m0);
+                    acc += bf2f((bf16)(wu[i] >> 16)) * bf2f(m1);
+                }
             } else {
-                xv = xr[k];
+                acc += dot8(wr, xr, k8);
             }
-            acc += bf2f(wr[k]) * bf2f(xv);
         }
         acc += __shfl_down_sync(0xffffffffu, acc, 16);
         acc += __shfl_down_sync(0xffffffffu, acc, 8);
@@ -451,8 +478,8 @@ __device__ void gemv_f(const bf16* W, const bf16* X, float* O,
         const bf16* xr = X + (long long)b * K;
         const bf16* wr = W + (long long)i * K;
         float acc = 0.f;
-        for (int k = lane; k < K; k += 32)
-            acc += bf2f(wr[k]) * bf2f(xr[k]);
+        for (int k8 = lane; k8 < K / 8; k8 += 32)
+            acc += dot8(wr, xr, k8);
         acc += __shfl_down_sync(0xffffffffu, acc, 16);
         acc += __shfl_down_sync(0xffffffffu, acc, 8);
         acc += __shfl_down_sync(0xffffffffu, acc, 4);
