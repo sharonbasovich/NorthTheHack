@@ -1020,9 +1020,12 @@ class Engine:
         st.inp.fill_(0)
         st.inp[:, 0] = c0[:, 0]
         ref_logits_b = None
+        self._batch_err = 15   # 15 = threw inside the step call itself
         try:
             self._decode_step_slow_batch(st)
+            self._batch_err = 1
             ref_logits_b = self._last_logits_b.clone().view(B, R, V)
+            self._batch_err = 2
             emit0 = st.emit_dev[:, 0].clone()
             restore()
             # the torch batch verify reuses exactly the same ops as the slow
@@ -1030,14 +1033,15 @@ class Engine:
             # semantics make every emitted token a true model argmax.
             st.spec_runner = lambda: self._decode_step_slow_batch(st)
             st.spec_ms = self._bench(st.spec_runner)
+            self._batch_err = 3
             st.spec_name = 1
             restore()
-        except Exception:
-            restore()
-            self._batch_probe(st)
+            self._batch_err = 0
+        except Exception as exc:
+            self._batch_exc = type(exc).__name__[:10]
             restore()
         if ref_logits_b is not None:
-            for make in ("ext", "jit", "graph", "eager", "rms"):
+            for make in ("ext", "jit", "graphb", "graph", "eager", "rms"):
                 if over_budget():
                     break
                 try:
@@ -1050,9 +1054,9 @@ class Engine:
                             continue
                         runner = self._ext.step_batch
                     elif make == "jit":
-                        # only if jit decode actually got adopted — batch
-                        # tracing is ~1400 ops and not worth it otherwise
-                        if not getattr(self, "_jit_ok", False):
+                        # jit trace of the batch pass: ~1400 ops, ~10-30s —
+                        # worth it whenever the jit probe passed.
+                        if not self._probe("jit"):
                             continue
                         disarm = self._watchdog(30)
                         try:
@@ -1060,6 +1064,13 @@ class Engine:
                                 lambda: self._decode_step_slow_batch(st), ())
                         finally:
                             disarm()
+                    elif make == "graphb" and self._probe("graph"):
+                        # pure-torch batch pass under a CUDA graph — no
+                        # Triton involvement; the step is capture-safe
+                        # (all writes go into preallocated buffers).
+                        g = self._capture(
+                            st, self._decode_step_slow_batch, 1)
+                        runner = g.replay
                     elif make == "graph" and (
                         _HAS_TRITON and not self._step_slow_only
                         and self._probe("graph")
@@ -1088,7 +1099,7 @@ class Engine:
                             st.spec_runner = runner
                             st.spec_name = {
                                 "ext": 2, "jit": 3, "graph": 4, "eager": 5,
-                                "rms": 6,
+                                "rms": 6, "graphb": 7,
                             }[make]
                         else:
                             self._dbg("spec %s margin_fail" % make)
