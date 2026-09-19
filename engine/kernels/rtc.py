@@ -356,7 +356,7 @@ extern "C" __global__ void silu_k(const bf16* __restrict__ gu,
 # co-resident: launched with nblk = SM count, 256 threads, modest smem —
 # guaranteed at least one resident block per SM on any modern part.
 MEGA_SRC = BF16_HELPERS + r"""
-#define NT 256
+#define NT 512
 #define HDIM 2560
 #define VDIM 151936
 #define IDIM 9728
@@ -430,32 +430,61 @@ __device__ void gemv(const bf16* W, const bf16* X, bf16* O,
     int nw = gridDim.x * (NT / 32);
     int lane = threadIdx.x & 31;
     int nout = B * Od;
-    for (int o = gw; o < nout; o += nw) {
-        int b = o / Od, i = o % Od;
-        const bf16* xr = fused ? (gu + (long long)b * 2 * K)
-                               : (X + (long long)b * K);
-        const bf16* wr = W + (long long)i * K;
-        float acc = 0.f;
-        int K8 = K / 8;
-        if (!fused) {
-            // software pipeline: prefetch next 16B pair before consuming
-            int k8 = lane;
-            int4 wv, xv;
+    if (!fused) {
+        // two output rows per warp, software-pipelined: 4 loads in flight
+        for (int o0 = gw * 2; o0 < nout; o0 += nw * 2) {
+            int o1 = o0 + 1;
+            const bf16* xr0 = X + (long long)(o0 / Od) * K;
+            const bf16* xr1 = o1 < nout ? X + (long long)(o1 / Od) * K
+                                        : xr0;
+            const bf16* wr0 = W + (long long)(o0 % Od) * K;
+            const bf16* wr1 = o1 < nout ? W + (long long)(o1 % Od) * K
+                                        : wr0;
+            float acc0 = 0.f, acc1 = 0.f;
+            int K8 = K / 8, k8 = lane;
+            int4 w0 = {}, x0 = {}, w1 = {}, x1 = {};
             if (k8 < K8) {
-                wv = *(const int4*)(wr + (long long)k8 * 8);
-                xv = *(const int4*)(xr + (long long)k8 * 8);
+                w0 = *(const int4*)(wr0 + (long long)k8 * 8);
+                x0 = *(const int4*)(xr0 + (long long)k8 * 8);
+                w1 = *(const int4*)(wr1 + (long long)k8 * 8);
+                x1 = *(const int4*)(xr1 + (long long)k8 * 8);
             }
             for (; k8 < K8; k8 += 32) {
                 int k8n = k8 + 32;
-                int4 wvn = {}, xvn = {};
+                int4 w0n = {}, x0n = {}, w1n = {}, x1n = {};
                 if (k8n < K8) {
-                    wvn = *(const int4*)(wr + (long long)k8n * 8);
-                    xvn = *(const int4*)(xr + (long long)k8n * 8);
+                    w0n = *(const int4*)(wr0 + (long long)k8n * 8);
+                    x0n = *(const int4*)(xr0 + (long long)k8n * 8);
+                    w1n = *(const int4*)(wr1 + (long long)k8n * 8);
+                    x1n = *(const int4*)(xr1 + (long long)k8n * 8);
                 }
-                acc += prod8(wv, xv);
-                wv = wvn; xv = xvn;
+                acc0 += prod8(w0, x0); acc1 += prod8(w1, x1);
+                w0 = w0n; x0 = x0n; w1 = w1n; x1 = x1n;
             }
-        } else
+            acc0 += __shfl_down_sync(0xffffffffu, acc0, 16);
+            acc0 += __shfl_down_sync(0xffffffffu, acc0, 8);
+            acc0 += __shfl_down_sync(0xffffffffu, acc0, 4);
+            acc0 += __shfl_down_sync(0xffffffffu, acc0, 2);
+            acc0 += __shfl_down_sync(0xffffffffu, acc0, 1);
+            acc1 += __shfl_down_sync(0xffffffffu, acc1, 16);
+            acc1 += __shfl_down_sync(0xffffffffu, acc1, 8);
+            acc1 += __shfl_down_sync(0xffffffffu, acc1, 4);
+            acc1 += __shfl_down_sync(0xffffffffu, acc1, 2);
+            acc1 += __shfl_down_sync(0xffffffffu, acc1, 1);
+            if (lane == 0) {
+                O[o0] = res ? bfadd(res[o0], f2bf(acc0)) : f2bf(acc0);
+                if (o1 < nout)
+                    O[o1] = res ? bfadd(res[o1], f2bf(acc1)) : f2bf(acc1);
+            }
+        }
+        return;
+    }
+    for (int o = gw; o < nout; o += nw) {
+        int b = o / Od, i = o % Od;
+        const bf16* xr = gu + (long long)b * 2 * K;
+        const bf16* wr = W + (long long)i * K;
+        float acc = 0.f;
+        int K8 = K / 8;
         for (int k8 = lane; k8 < K8; k8 += 32) {
             {
                 // silu(x) * u on the fly, 8 lanes of work at once
@@ -495,34 +524,49 @@ __device__ void gemv_f(const bf16* W, const bf16* X, float* O,
     int gw = blockIdx.x * (NT / 32) + (threadIdx.x >> 5);
     int nw = gridDim.x * (NT / 32);
     int lane = threadIdx.x & 31;
-    for (int o = gw; o < B * Od; o += nw) {
-        int b = o / Od, i = o % Od;
-        const bf16* xr = X + (long long)b * K;
-        const bf16* wr = W + (long long)i * K;
-        float acc = 0.f;
-        int K8 = K / 8;
-        int k8 = lane;
-        int4 wv = {}, xv = {};
+    for (int o0 = gw * 2; o0 < B * Od; o0 += nw * 2) {
+        int o1 = o0 + 1;
+        const bf16* xr0 = X + (long long)(o0 / Od) * K;
+        const bf16* xr1 = o1 < B * Od ? X + (long long)(o1 / Od) * K
+                                      : xr0;
+        const bf16* wr0 = W + (long long)(o0 % Od) * K;
+        const bf16* wr1 = o1 < B * Od ? W + (long long)(o1 % Od) * K
+                                      : wr0;
+        float acc0 = 0.f, acc1 = 0.f;
+        int K8 = K / 8, k8 = lane;
+        int4 w0 = {}, x0 = {}, w1 = {}, x1 = {};
         if (k8 < K8) {
-            wv = *(const int4*)(wr + (long long)k8 * 8);
-            xv = *(const int4*)(xr + (long long)k8 * 8);
+            w0 = *(const int4*)(wr0 + (long long)k8 * 8);
+            x0 = *(const int4*)(xr0 + (long long)k8 * 8);
+            w1 = *(const int4*)(wr1 + (long long)k8 * 8);
+            x1 = *(const int4*)(xr1 + (long long)k8 * 8);
         }
         for (; k8 < K8; k8 += 32) {
             int k8n = k8 + 32;
-            int4 wvn = {}, xvn = {};
+            int4 w0n = {}, x0n = {}, w1n = {}, x1n = {};
             if (k8n < K8) {
-                wvn = *(const int4*)(wr + (long long)k8n * 8);
-                xvn = *(const int4*)(xr + (long long)k8n * 8);
+                w0n = *(const int4*)(wr0 + (long long)k8n * 8);
+                x0n = *(const int4*)(xr0 + (long long)k8n * 8);
+                w1n = *(const int4*)(wr1 + (long long)k8n * 8);
+                x1n = *(const int4*)(xr1 + (long long)k8n * 8);
             }
-            acc += prod8(wv, xv);
-            wv = wvn; xv = xvn;
+            acc0 += prod8(w0, x0); acc1 += prod8(w1, x1);
+            w0 = w0n; x0 = x0n; w1 = w1n; x1 = x1n;
         }
-        acc += __shfl_down_sync(0xffffffffu, acc, 16);
-        acc += __shfl_down_sync(0xffffffffu, acc, 8);
-        acc += __shfl_down_sync(0xffffffffu, acc, 4);
-        acc += __shfl_down_sync(0xffffffffu, acc, 2);
-        acc += __shfl_down_sync(0xffffffffu, acc, 1);
-        if (lane == 0) O[o] = acc;
+        acc0 += __shfl_down_sync(0xffffffffu, acc0, 16);
+        acc0 += __shfl_down_sync(0xffffffffu, acc0, 8);
+        acc0 += __shfl_down_sync(0xffffffffu, acc0, 4);
+        acc0 += __shfl_down_sync(0xffffffffu, acc0, 2);
+        acc0 += __shfl_down_sync(0xffffffffu, acc0, 1);
+        acc1 += __shfl_down_sync(0xffffffffu, acc1, 16);
+        acc1 += __shfl_down_sync(0xffffffffu, acc1, 8);
+        acc1 += __shfl_down_sync(0xffffffffu, acc1, 4);
+        acc1 += __shfl_down_sync(0xffffffffu, acc1, 2);
+        acc1 += __shfl_down_sync(0xffffffffu, acc1, 1);
+        if (lane == 0) {
+            O[o0] = acc0;
+            if (o1 < B * Od) O[o1] = acc1;
+        }
     }
 }
 
@@ -937,7 +981,7 @@ class RtcKernels:
                  qkv, obuf, gu, logits, amaxv, amaxi, cnt, gen,
                  flag_dev, tokm_dev, B, NL, ntok, eps, cap):
         smem = (cap + 8) * 6 + 512
-        self.rtc.launch(self.megafn, self.nblk, 256, smem,
+        self.rtc.launch(self.megafn, self.nblk, 512, smem,
                         [ptr(lw), ptr(embed), ptr(finw), ptr(cost),
                          ptr(sint), ptr(pos), ptr(cur), ptr(hid),
                          ptr(hbuf), ptr(qkv), ptr(obuf), ptr(gu),
