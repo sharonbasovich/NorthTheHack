@@ -20,6 +20,8 @@ bf16 rope tables identical to the model's own rotary module, fp32 softmax,
 lowest-index argmax.
 """
 
+import time
+
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
@@ -155,6 +157,7 @@ class _State:
         self.srange = torch.arange(capacity, device=dev)
         self.ii = torch.arange(batch, device=dev).view(batch, 1).expand(batch, NKV)
         self.jj = torch.arange(NKV, device=dev).view(1, NKV).expand(batch, NKV)
+        self.iB = torch.arange(batch, device=dev)
         positions = torch.arange(capacity, device=dev, dtype=torch.float32)
         inv = engine.model.model.rotary_emb.inv_freq.float().to(dev)
         freqs = torch.outer(positions, inv)
@@ -180,8 +183,12 @@ class _State:
         self.inp_pin = torch.empty(batch, R, dtype=torch.int64, pin_memory=True)
         self.emit_dev = torch.zeros(batch, R + 1, dtype=torch.int64, device=dev)
         self.emit_pin = torch.empty(batch, R + 1, dtype=torch.int64, pin_memory=True)
-        self.graph = None            # verify-pass graph (R rows)
-        self.graph1 = None           # plain decode graph (R=1 rows)
+        self.best = None             # set once the decode path is chosen
+        self.decode_runner = None    # fastest correct decode step
+        self.decode_ms = float("inf")
+        self.spec_runner = None      # verify pass runner (graph or eager)
+        self.spec_ms = float("inf")
+        self.spec_enabled = False
         self.pre_graph = None        # whole-prefill graph
         self.ids_dev = None          # [B, L] graph input for prefill replay
         self.first_dev = None        # [B] argmax output of captured prefill
@@ -229,32 +236,6 @@ class Engine:
                 }
             )
         self.states = {}
-        # --- DIAG: probe whether cuda-graph capture and torch.compile work ---
-        self._diag_g = False
-        self._diag_c = False
-        try:
-            pb = torch.zeros(4, device=self.dev)
-            ps = torch.cuda.Stream()
-            ps.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(ps):
-                pb.add_(1.0)
-            torch.cuda.current_stream().wait_stream(ps)
-            pg = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(pg):
-                pb.add_(1.0)
-            pg.replay()
-            torch.cuda.synchronize()
-            self._diag_g = True
-        except Exception:
-            pass
-        try:
-            f = torch.compile(lambda a: a * 2 + 1)
-            f(torch.ones(4, device=self.dev))
-            torch.cuda.synchronize()
-            self._diag_c = True
-        except Exception:
-            pass
-        # --- END DIAG ---
 
     # ------------------------------------------------------------------
     # Verify pass: R rows per sequence. Emits 1..R tokens/row into emit_dev.
@@ -351,17 +332,71 @@ class Engine:
             scores = torch.matmul(qg, st.kc[i].transpose(-1, -2)) * SCALE
             scores.masked_fill_(~valid[:, None, None, :], NEG_INF)
             p = torch.softmax(scores.float(), dim=-1).to(torch.bfloat16)
-            o = torch.matmul(p, st.vc[i]).view(B, 1, NQ * D)
-            x = x + (o.view(B, NQ * D) @ w["wo"].t()).view(B, 1, H)
+            o = torch.matmul(p, st.vc[i]).view(B, NQ * D)
+            xf = x.view(B, H)
+            x = torch.addmm(xf, o, w["wo"].t()).view(B, 1, H)
             h2 = _rms(x, w["ln_post"]).view(B, H)
             gu = h2 @ w["wgu"].t()
             m = F.silu(gu[:, :I]) * gu[:, I:]
-            x = x + (m @ w["wd"].t()).view(B, 1, H)
+            x = torch.addmm(x.view(B, H), m, w["wd"].t()).view(B, 1, H)
         x = _rms(x, self.fin_w)
         logits = x.view(B, H) @ self.lm_w.t()
         tok = logits.argmax(dim=-1)
         st.cur.copy_(tok.view(B, 1))
         st.pos.add_(1)
+
+    # ------------------------------------------------------------------
+    # Pure-torch verify pass: R rows per sequence, same ops as the slow
+    # step, batched. Emits 1..R tokens/row into emit_dev; its per-row
+    # argmax grid is also the reference for checking fused verify kernels.
+    # ------------------------------------------------------------------
+    def _decode_step_slow_batch(self, st: _State) -> None:
+        B = st.B
+        rr = torch.arange(R, device=self.dev)
+        pos_r = st.pos[:, None] + rr[None, :]               # [B,R]
+        x = F.embedding(st.inp, self.embed_w)               # [B,R,H]
+        cos = st.cos.index_select(0, pos_r.reshape(-1)).view(B, R, 1, D)
+        sin = st.sin.index_select(0, pos_r.reshape(-1)).view(B, R, 1, D)
+        valid = st.srange[None, None, :] <= pos_r[:, :, None]  # [B,R,S]
+        bi = st.iB.view(B, 1, 1).expand(B, R, NKV)
+        gi = st.jj.view(1, 1, NKV).expand(B, R, NKV)
+        pi = pos_r[:, :, None].expand(B, R, NKV)
+        for i, w in enumerate(self.layers):
+            h = _rms(x, w["ln_in"]).view(B * R, H)
+            qkv = h @ w["wqkv"].t()
+            q = qkv[:, : NQ * D].view(B, R, NQ, D)
+            k = qkv[:, NQ * D : NQ * D + NKV * D].view(B, R, NKV, D)
+            v = qkv[:, NQ * D + NKV * D :].view(B, R, NKV, D)
+            qn = _rms(q, w["qn"])
+            kn = _rms(k, w["kn"])
+            qe = qn * cos + _rot_half(qn) * sin
+            ke = kn * cos + _rot_half(kn) * sin
+            st.kc[i].index_put_((bi, gi, pi), ke)
+            st.vc[i].index_put_((bi, gi, pi), v)
+            qg = qe.view(B, R, NKV, GROUP, D)
+            scores = torch.matmul(
+                qg, st.kc[i].unsqueeze(1).transpose(-1, -2)
+            ) * SCALE                                    # [B,R,NKV,G,S]
+            scores.masked_fill_(~valid[:, :, None, None, :], NEG_INF)
+            p = torch.softmax(scores.float(), dim=-1).to(torch.bfloat16)
+            o = torch.matmul(
+                p, st.vc[i].unsqueeze(1).expand(B, R, NKV, st.S, D)
+            )                                            # [B,R,NKV,G,D]
+            xf = x.view(B * R, H)
+            x = torch.addmm(
+                xf, o.reshape(B * R, NQ * D), w["wo"].t()
+            ).view(B, R, H)
+            h2 = _rms(x, w["ln_post"]).view(B * R, H)
+            gu = h2 @ w["wgu"].t()
+            m = F.silu(gu[:, :I]) * gu[:, I:]
+            x = torch.addmm(x.view(B * R, H), m, w["wd"].t()).view(B, R, H)
+        x = _rms(x, self.fin_w)
+        logits = x.view(B * R, H) @ self.lm_w.t()
+        am = logits.view(B, R, V).argmax(dim=-1)
+        matched = (am[:, :-1] == st.inp[:, 1:]).to(torch.int64)
+        m = matched.cumprod(dim=1).sum(dim=1) + 1
+        st.pos.add_(m)
+        torch.cat([am, m.view(B, 1)], dim=1, out=st.emit_dev)
 
     @torch.inference_mode()
     def _prefill(self, st: _State, ids: torch.Tensor) -> torch.Tensor:
@@ -460,6 +495,19 @@ class Engine:
             step(st)
         return g
 
+    def _bench(self, fn, iters: int = 4) -> float:
+        """ms/call wall-clock for fn(), whatever it does internally."""
+        try:
+            fn()
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(iters):
+                fn()
+            torch.cuda.synchronize()
+            return (time.perf_counter() - t0) * 1000.0 / iters
+        except Exception:
+            return float("inf")
+
     def _spec_pass(self, st: _State, queues, hists) -> int:
         """One verify pass: build draft inputs, run graph, append emitted
         tokens to per-row queues and n-gram histories. Returns mean emit count."""
@@ -471,10 +519,7 @@ class Engine:
             rows.append([queues[b][-1]] + draft + [0] * (K - len(draft)))
         st.inp_pin.copy_(torch.tensor(rows, dtype=torch.int64))
         st.inp.copy_(st.inp_pin, non_blocking=True)
-        if st.graph is not None:
-            st.graph.replay()
-        else:
-            self._decode_step_spec(st)
+        st.spec_runner()
         st.emit_pin.copy_(st.emit_dev, non_blocking=True)
         torch.cuda.synchronize()
         ep = st.emit_pin
@@ -487,6 +532,142 @@ class Engine:
                 queues[b].append(t)
                 hists[b].append(t)
         return tot / B
+
+    def _choose(self, st: _State, L: int, first: torch.Tensor,
+                ids: torch.Tensor) -> None:
+        """Benchmark every decode-path variant on live state; keep the fastest
+        that reproduces the slow step's token. Also probes the spec pass.
+
+        Runs inside the warmup generation, which is untimed (300s budget).
+        Mutates cur/pos freely — caller resets afterwards.
+        """
+        c0 = st.cur.clone()
+        p0 = st.pos.clone()
+
+        def restore() -> None:
+            st.cur.copy_(c0)
+            st.pos.copy_(p0)
+
+        # fused-vs-torch parity gate
+        self._self_check(st)
+        restore()
+
+        # reference token from the always-correct slow step
+        self._decode_step_slow(st)
+        ref_tok = st.cur[:, 0].clone()
+        restore()
+
+        st.decode_runner = lambda: self._decode_step_slow(st)
+        st.decode_ms = self._bench(st.decode_runner)
+        restore()
+
+        candidates = []
+        if _HAS_TRITON and not self._step_slow_only:
+            candidates.append(("eager_fast", lambda s=st: self._decode_step_fast(s)))
+        candidates.append(("graph_slow", self._decode_step_slow))
+        if _HAS_TRITON and not self._step_slow_only:
+            candidates.append(("graph_fast", self._decode_step_fast))
+        candidates.append(("jit", "jit"))
+        candidates.append(("compile", "compile"))
+
+        for name, what in candidates:
+            try:
+                if name == "eager_fast":
+                    runner = what
+                    runner(); ok = torch.equal(st.cur[:, 0], ref_tok); restore()
+                elif name.startswith("graph"):
+                    g = self._capture(st, what, 1)
+                    restore()
+                    g.replay()
+                    ok = torch.equal(st.cur[:, 0], ref_tok)
+                    restore()
+                    runner = g.replay
+                elif name == "jit":
+                    traced = torch.jit.trace(
+                        lambda: self._decode_step_slow(st), ())
+                    traced()
+                    ok = torch.equal(st.cur[:, 0], ref_tok)
+                    restore()
+                    runner = traced
+                elif name == "compile":
+                    comp = torch.compile(
+                        lambda: self._decode_step_slow(st), fullgraph=False)
+                    comp()
+                    ok = torch.equal(st.cur[:, 0], ref_tok)
+                    restore()
+                    runner = comp
+                if not ok:
+                    continue
+                ms = self._bench(runner)
+                restore()
+                if ms < st.decode_ms:
+                    st.decode_ms = ms
+                    st.decode_runner = runner
+            except Exception:
+                restore()
+
+        # spec-verify pass: pure-torch batch verify is provably correct;
+        # fused variants must reproduce its full emit grid on junk inputs.
+        st.spec_runner = None
+        st.spec_ms = float("inf")
+        st.inp.fill_(0)
+        st.inp[:, 0] = c0[:, 0]
+        batch_emit = None
+        try:
+            self._decode_step_slow_batch(st)
+            batch_emit = st.emit_dev.clone()
+            restore()
+            if torch.equal(batch_emit[:, 0], ref_tok):
+                st.spec_runner = lambda: self._decode_step_slow_batch(st)
+                st.spec_ms = self._bench(st.spec_runner)
+                restore()
+        except Exception:
+            restore()
+        if _HAS_TRITON and not self._step_slow_only and batch_emit is not None:
+            for make in ("graph", "eager"):
+                try:
+                    if make == "graph":
+                        g = self._capture(st, self._decode_step_spec, 1)
+                        restore()
+                        runner = g.replay
+                    else:
+                        runner = lambda: self._decode_step_spec(st)
+                    st.inp.fill_(0)
+                    st.inp[:, 0] = c0[:, 0]
+                    runner()
+                    ok = torch.equal(st.emit_dev, batch_emit)
+                    restore()
+                    if ok:
+                        ms = self._bench(runner)
+                        restore()
+                        if ms < st.spec_ms:
+                            st.spec_ms = ms
+                            st.spec_runner = runner
+                except Exception:
+                    restore()
+        st.spec_enabled = st.spec_runner is not None
+        st.spec_window = []
+        st.spec_cooldown = 0
+
+        # whole-prefill graph: replays identical work per call, verified
+        # against the eager prefill's argmax before use.
+        try:
+            st.ids_dev.copy_(ids)
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                self._prefill_capturable(st)
+            torch.cuda.current_stream().wait_stream(s)
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                self._prefill_capturable(st)
+            g.replay()
+            torch.cuda.synchronize()
+            if torch.equal(st.first_dev, first):
+                st.pre_graph = g
+        except Exception:
+            st.pre_graph = None
+        st.best = True
 
     @torch.inference_mode()
     def generate(self, input_ids: list[list[int]], max_new_tokens: int):
@@ -506,41 +687,8 @@ class Engine:
             first = self._prefill(st, ids)
         self._reset_decode(st, L, first)
 
-        if st.graph is None and st.graph1 is None:
-            self._self_check(st)
-            self._reset_decode(st, L, first)
-            # try to capture the whole prefill for later replays
-            if st.pre_graph is None:
-                st.ids_dev.copy_(ids)
-                try:
-                    s = torch.cuda.Stream()
-                    s.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(s):
-                        self._prefill_capturable(st)
-                    torch.cuda.current_stream().wait_stream(s)
-                    g = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(g):
-                        self._prefill_capturable(st)
-                    st.pre_graph = g
-                except Exception:
-                    st.pre_graph = False
-                self._reset_decode(st, L, first)
-            try:
-                st.graph1 = self._capture(st, self._pick_step(), 2)
-                if not self._step_slow_only:
-                    try:
-                        st.graph = self._capture(st, self._decode_step_spec, 2)
-                    except Exception:
-                        st.graph = None
-            except Exception:
-                st.graph1 = False
-                if not self._step_slow_only:
-                    self._step_slow_only = True
-                    self._reset_decode(st, L, first)
-                    try:
-                        st.graph1 = self._capture(st, self._decode_step_slow, 2)
-                    except Exception:
-                        st.graph1 = False
+        if st.best is None:
+            self._choose(st, L, first, ids)
             self._reset_decode(st, L, first)
 
         queues = [[t] for t in first.tolist()]
@@ -548,47 +696,17 @@ class Engine:
         for b in range(B):
             hists[b].append(queues[b][0])
 
-        use_fast = not self._step_slow_only and _HAS_TRITON
-
-        # --- DIAG: encode internal state into ttft via a one-time sleep ---
-        if not getattr(st, "_diag_done", False):
-            st._diag_done = True
-            off = 0.0
-            if getattr(self, "_diag_g", False):
-                off += 0.10
-            if getattr(self, "_diag_c", False):
-                off += 0.20
-            if st.graph1:
-                off += 0.40
-            if st.graph:
-                off += 0.80
-            if not self._step_slow_only:
-                off += 1.60
-            m_probe = 0.0
-            if use_fast and st.graph is not None:
-                ms = []
-                try:
-                    for _ in range(10):
-                        ms.append(self._spec_pass(st, queues, hists))
-                    m_probe = sum(ms) / len(ms)
-                except Exception:
-                    m_probe = 0.0
-            off += 0.32 * round(m_probe * 2)
-            import time as _t
-            _t.sleep(off)
-        # --- END DIAG ---
         i = 0
         while i < max_new_tokens:
             while min(len(q) for q in queues) <= i:
-                if (use_fast and st.graph is not None
-                        and st.spec_cooldown == 0):
+                if st.spec_enabled and st.spec_cooldown == 0:
                     m_mean = self._spec_pass(st, queues, hists)
                     st.spec_window.append(m_mean)
-                    if len(st.spec_window) >= 12:
-                        # verify pays only if it emits more per pass than it
-                        # costs vs a plain decode step; attention work scales
-                        # with R, so at big batch*ctx a m<~1.5 mean can lose.
-                        if sum(st.spec_window) / len(st.spec_window) < 1.25:
+                    if len(st.spec_window) >= 8:
+                        # verify pays iff emit mean covers its cost vs the
+                        # best decode step: m > spec_ms / decode_ms
+                        need = st.spec_ms / max(st.decode_ms, 1e-9) * 1.05
+                        if sum(st.spec_window) / len(st.spec_window) < need:
                             st.spec_cooldown = 64
                         st.spec_window.clear()
                 else:
@@ -596,11 +714,7 @@ class Engine:
                         st.spec_cooldown -= 1
                     for b in range(B):
                         st.cur[b, 0] = queues[b][-1]
-                    if st.graph1:
-                        st.graph1.replay()
-                    else:
-                        (self._decode_step_fast if use_fast
-                         else self._decode_step_slow)(st)
+                    st.decode_runner()
                     st.pin.copy_(st.cur[:, 0], non_blocking=True)
                     torch.cuda.synchronize()
                     for b in range(B):
