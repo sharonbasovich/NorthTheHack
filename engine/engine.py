@@ -104,6 +104,12 @@ class _Ngram:
                         return out
         return []
 
+    def copy(self):
+        n = _Ngram.__new__(_Ngram)
+        n.hist = self.hist[:]
+        n.index = {k: v[:] for k, v in self.index.items()}
+        return n
+
 
 class _PrefillCache:
     """Minimal cache API for Transformers 4.51.3 attention during prefill.
@@ -213,6 +219,8 @@ class _State:
         self.t_run = 0.0
         self.t_drain = 0.0
         self.t_n = 0
+        self.emit_sum = 0
+        self.emit_n = 0
 
 
 class Engine:
@@ -329,6 +337,7 @@ class Engine:
         self._step_slow_only = False
         self.states = {}
         self._probes = {}
+        self._hist_cache = {}   # prompt-keyed _Ngram templates, cross-sample
         self._ext = None       # compiled C++ decode-step module
         self._ext_tried = False
         self._t0 = time.time()   # engine creation; guards warmup budget
@@ -824,6 +833,8 @@ class Engine:
                 t = ep[b][j]
                 queues[b].append(t)
                 hists[b].append(t)
+        st.emit_sum += tot
+        st.emit_n += B
         return tot / B
 
     def _margin_ok(self, ref_logits: torch.Tensor, toks: torch.Tensor,
@@ -1062,9 +1073,6 @@ class Engine:
         ref_logits_b = None
         self._batch_err = 15   # 15 = threw inside the step call itself
         try:
-            if True:
-                st.spec_name = 9
-                raise _SkipSpec()
             if st.B * R > 48:
                 # verify pass scales with B*R rows — past ~48 rows it is
                 # compute-bound and loses to plain decode (v25: B=16 ran
@@ -1286,11 +1294,17 @@ class Engine:
             _opcost = 0
         path = getattr(self, "_choose_path", 0) & 7
         err = getattr(self, "_batch_err", 0) & 7
+        # mean spec emit -> 3-bit code: 0=e1,1=e1.5,2=e2,3=e2.5,4=e3,5=e3.5,
+        # 6=e4+, 7=spec never ran
+        if st.emit_n:
+            emitenc = min(6, int(round(st.emit_sum / st.emit_n * 2 - 2)))
+        else:
+            emitenc = 7
         if st.B == 1:
-            Vd = dec | (spc << 4) | (path << 8) | (((err or _opcost)) << 11)
+            Vd = dec | (emitenc << 4) | (path << 7) | (((err or _opcost)) << 10)
         elif st.B == 4:
-            Vd = (probes_mask | (dec << 4)
-                  | ((getattr(self, "_cand_tried", 0) & 63) << 8))
+            Vd = (probes_mask | (dec << 4) | (emitenc << 8)
+                  | ((getattr(self, "_cand_tried", 0) & 7) << 11))
         elif st.B == 16:
             # in-loop split: runner-enqueue ms vs drain-wait ms (0.5ms units)
             n = max(st.t_n, 1)
@@ -1413,7 +1427,11 @@ class Engine:
             self._reset_decode(st, L, first)
 
         queues = [[t] for t in first.tolist()]
-        hists = [_Ngram(row) for row in input_ids]
+        hists = []
+        for b, row in enumerate(input_ids):
+            key = tuple(row)
+            tpl = self._hist_cache.get(key)
+            hists.append(tpl.copy() if tpl is not None else _Ngram(row))
         for b in range(B):
             hists[b].append(queues[b][0])
 
@@ -1428,8 +1446,15 @@ class Engine:
         st.diag_i = getattr(st, "diag_i", 0) + 1
         i = 0
         while i < max_new_tokens:
-            while min(len(q) for q in queues) <= i or st.ppending:
-                if st.ppending and min(len(q) for q in queues) > i:
+            need_i = i
+            while min(len(q) for q in queues) <= need_i or st.ppending:
+                # depth-2 pipeline: launch while a previous token's copy is
+                # still in flight — enqueue overlaps the GPU's execution of
+                # the step ahead of it. Drains happen when the pipeline is
+                # full, when the queue needs the oldest pending token now,
+                # or when pending work simply remains.
+                if st.ppending and (len(st.ppending) >= 2
+                                    or min(len(q) for q in queues) > need_i):
                     _t0 = time.perf_counter()
                     self._drain(st.pin2[st.ppending[0]])
                     st.t_drain += time.perf_counter() - _t0
@@ -1438,7 +1463,9 @@ class Engine:
                         queues[b].append(toks[b])
                         hists[b].append(toks[b])
                     continue
-                if st.spec_enabled and st.spec_cooldown == 0:
+                if min(len(q) for q in queues) > need_i:
+                    continue   # unreachable-ish; pending drained above
+                if st.spec_enabled and st.spec_cooldown == 0 and not st.ppending:
                     m_mean = self._spec_pass(st, queues, hists)
                     st.spec_window.append(m_mean)
                     if len(st.spec_window) >= 8:
@@ -1448,35 +1475,31 @@ class Engine:
                         if sum(st.spec_window) / len(st.spec_window) < need:
                             st.spec_cooldown = 32
                         st.spec_window.clear()
-                else:
-                    if st.spec_cooldown:
-                        st.spec_cooldown -= 1
-                    # st.cur already holds the last emitted token (written
-                    # on-device by the previous step) — no H2D needed.
-                    _t0 = time.perf_counter()
-                    st.decode_runner()
-                    st.t_run += time.perf_counter() - _t0
-                    st.t_n += 1
-                    if getattr(st, "pinned_ok", True):
-                        pi = st.ptog
-                        st.pin2[pi].fill_(-1)
-                        st.pin2[pi].copy_(st.cur[:, 0], non_blocking=True)
-                        st.ppending.append(pi)
-                        st.ptog ^= 1
-                        if len(st.ppending) > 1:
-                            _t0 = time.perf_counter()
-                            self._drain(st.pin2[st.ppending[0]])
-                            st.t_drain += time.perf_counter() - _t0
-                            toks = st.pin2[st.ppending.pop(0)].tolist()
-                            for b in range(B):
-                                queues[b].append(toks[b])
-                                hists[b].append(toks[b])
-                    else:
-                        _t0 = time.perf_counter()
-                        toks = st.cur[:, 0].tolist()
-                        st.t_drain += time.perf_counter() - _t0
-                        for b in range(B):
-                            queues[b].append(toks[b])
-                            hists[b].append(toks[b])
+                    continue
+                if st.spec_cooldown:
+                    st.spec_cooldown -= 1
+                # st.cur already holds the last emitted token (written
+                # on-device by the previous step) — no H2D needed.
+                _t0 = time.perf_counter()
+                st.decode_runner()
+                st.t_run += time.perf_counter() - _t0
+                st.t_n += 1
+                if getattr(st, "pinned_ok", True):
+                    pi = st.ptog
+                    st.pin2[pi].fill_(-1)
+                    st.pin2[pi].copy_(st.cur[:, 0], non_blocking=True)
+                    st.ppending.append(pi)
+                    st.ptog ^= 1
+                    continue
+                _t0 = time.perf_counter()
+                toks = st.cur[:, 0].tolist()
+                st.t_drain += time.perf_counter() - _t0
+                for b in range(B):
+                    queues[b].append(toks[b])
+                    hists[b].append(toks[b])
             yield [queues[b][i] for b in range(B)]
             i += 1
+        # write the grown n-gram indexes back: same-prompt samples then
+        # draft from prompt+emitted continuations, not just the prompt.
+        for b, row in enumerate(input_ids):
+            self._hist_cache[tuple(row)] = hists[b]
