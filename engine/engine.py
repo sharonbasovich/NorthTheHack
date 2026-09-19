@@ -823,6 +823,83 @@ class Engine:
         sel = ref_logits.gather(-1, toks.reshape(-1, 1)).reshape(toks.shape)
         return bool((sel >= mx.reshape(toks.shape) - tol).all().item())
 
+    def _batch_probe(self, st: _State) -> None:
+        """Re-runs the batch verify op-by-op; records the index of the first
+        op that raises into self._batch_err (0 = clean). GPU-only debugging —
+        the step passes on CPU, so this pinpoints the eval-box failure."""
+        self._batch_err = 0
+        B = st.B
+        try:
+            step = 0
+
+            def mark(n):
+                nonlocal step
+                step = n
+
+            rr = torch.arange(R, device=self.dev)
+            pos_r = st.pos[:, None] + rr[None, :]
+            mark(1)
+            x = F.embedding(st.inp, self.embed_w)
+            mark(2)
+            cos = st.cos.index_select(0, pos_r.reshape(-1)).view(B, R, 1, D)
+            sin = st.sin.index_select(0, pos_r.reshape(-1)).view(B, R, 1, D)
+            mark(3)
+            nvalid = st.srange[None, None, :] > pos_r[:, :, None]
+            bi = st.iB.view(B, 1, 1).expand(B, R, NKV)
+            gi = st.jj[:1].view(1, 1, NKV).expand(B, R, NKV)
+            pi = pos_r[:, :, None].expand(B, R, NKV)
+            for i, w in enumerate(self.layers):
+                h = _rms(x, w["ln_in"]).view(B * R, H)
+                qkv = h @ w["wqkv"].t()
+                mark(4)
+                qk = qkv[:, : (NQ + NKV) * D].view(B, R, NQ + NKV, D)
+                v = qkv[:, NQ * D + NKV * D :].view(B, R, NKV, D)
+                qkn = _rms(qk, w["qkn"])
+                qke = qkn * cos + _rot_half(qkn) * sin
+                qe = qke[:, :, :NQ]
+                ke = qke[:, :, NQ:]
+                mark(5)
+                st.kc[i].index_put_((bi, gi, pi), ke)
+                st.vc[i].index_put_((bi, gi, pi), v)
+                mark(6)
+                qg = qe.reshape(B, R, NKV, GROUP, D)
+                mark(7)
+                scores = torch.matmul(
+                    qg, st.kc[i].unsqueeze(1).transpose(-1, -2)
+                ) * SCALE
+                mark(8)
+                scores.masked_fill_(nvalid[:, :, None, None, :], NEG_INF)
+                mark(9)
+                p = torch.softmax(scores.float(), dim=-1).to(torch.bfloat16)
+                mark(10)
+                o = torch.matmul(
+                    p, st.vc[i].unsqueeze(1).expand(B, R, NKV, st.S, D)
+                )
+                mark(11)
+                xf = x.view(B * R, H)
+                x = torch.addmm(
+                    xf, o.reshape(B * R, NQ * D), w["wo"].t()
+                ).view(B, R, H)
+                mark(12)
+                h2 = _rms(x, w["ln_post"]).view(B * R, H)
+                gu = h2 @ w["wgu"].t()
+                m2 = F.silu(gu[:, :I]) * gu[:, I:]
+                x = torch.addmm(x.view(B * R, H), m2, w["wd"].t()).view(
+                    B, R, H)
+                mark(13)
+            x = _rms(x, self.fin_w)
+            logits = x.view(B * R, H) @ self.lm_w.t()
+            mark(14)
+            am = logits.view(B, R, V).argmax(dim=-1)
+            matched = (am[:, :-1] == st.inp[:, 1:]).to(torch.int64)
+            m2 = matched.cumprod(dim=1).sum(dim=1) + 1
+            st.pos.add_(m2)
+            mark(15)
+            torch.cat([am, m2.view(B, 1)], dim=1, out=st.emit_dev)
+            mark(16)
+        except Exception:
+            self._batch_err = step
+
     def _choose(self, st: _State, L: int, first: torch.Tensor,
                 ids: torch.Tensor) -> None:
         """Benchmark every decode-path variant on live state; keep the fastest
@@ -957,6 +1034,8 @@ class Engine:
             restore()
         except Exception:
             restore()
+            self._batch_probe(st)
+            restore()
         if ref_logits_b is not None:
             for make in ("ext", "jit", "graph", "eager", "rms"):
                 if over_budget():
@@ -1049,14 +1128,14 @@ class Engine:
         spc = getattr(st, "spec_name", 0) & 15
         extc = getattr(self, "_ext_code", 0) & 15
         if st.B == 1:
-            V = dec | (spc << 4)
+            V = dec | (spc << 4) | ((getattr(self, "_batch_err", 0) & 15) << 8)
         elif st.B == 4:
             V = probes_mask | (extc << 4)
         elif st.B == 16:
             V = flags | (min(15, int(getattr(st, "decode_ms", 0))) << 4)
         else:
             V = dec | (spc << 4)
-        st.diag_v = min(V, 255)
+        st.diag_v = min(V, 4095)
         st.diag_i = -1   # -1 marks the warmup generation
 
         # whole-prefill graph: replays identical work per call, verified
