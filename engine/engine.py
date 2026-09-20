@@ -22,6 +22,7 @@ lowest-index argmax.
 
 import os
 import time
+import ctypes
 
 import torch
 import torch.nn.functional as F
@@ -549,10 +550,19 @@ class Engine:
             st.m_cnt = torch.zeros(B, dtype=torch.int32, device=dev)
             st.m_gen = torch.zeros(B, dtype=torch.int32, device=dev)
             self._mega_stage = 3
-            # host-mapped: B per-group flag words + tokcap slots of B each
+            # device-resident flag/token area; host polls via async D2H
+            # copies on a side stream (copy engine runs concurrent with
+            # the persistent kernel). Layout: B flag words then
+            # tokcap rows of B token ids.
             st.m_tokcap = 512
-            st.m_map, st.m_mapdev = rk.host_map(
-                8 * B + st.m_tokcap * B * 8)
+            st.m_flagtok = torch.zeros(
+                B + st.m_tokcap * B, dtype=torch.int64, device=dev)
+            st.m_mapdev = st.m_flagtok.data_ptr()
+            st.m_hflag = torch.zeros(B, dtype=torch.int64,
+                                     pin_memory=True)
+            st.m_htok = torch.zeros(B, dtype=torch.int64,
+                                    pin_memory=True)
+            st.m_pstream = torch.cuda.Stream()
             self._mega_stage = 4
         self._mega_stage = 5
         rk.step_all(st.m_lw, self.embed_w, self.fin_w, st.cos, st.sin,
@@ -1210,7 +1220,7 @@ class Engine:
                         # flag write reached the host while the kernel ran
                         torch.cuda.synchronize()
                         st.mega_flag = bool(
-                            min(st.m_map[b] for b in range(st.B)) > 0)
+                            min(st.m_flagtok[:st.B].tolist()) > 0)
                     if name == "eager_rtc":
                         self._rtc_status = 1 if ok else 2
                     if name == "eager_sdpa":
@@ -1801,22 +1811,37 @@ class Engine:
                         self._decode_all(st, st.m_total)
                         st.t_run += time.perf_counter() - _t0
                         st.t_n += 1
-                    mv = st.m_map
                     j = st.m_j = getattr(st, "m_j", 0)
-                    slot = B + j * B
                     _d0 = time.perf_counter()
                     want = j + 1
-                    while min(mv[b] for b in range(B)) < want:
+                    cu = self._rtk.rtc.cuda
+                    sh = st.m_pstream.cuda_stream
+                    hp = ctypes.c_void_p(st.m_hflag.data_ptr())
+                    fp = ctypes.c_void_p(st.m_mapdev)
+                    while True:
+                        cu.cuMemcpyDtoHAsync(hp, fp, 8 * B, sh)
+                        while cu.cuStreamQuery(ctypes.c_void_p(sh)):
+                            pass
+                        if min(st.m_hflag.tolist()) >= want:
+                            break
                         if time.perf_counter() - _d0 > 30.0:
                             raise RuntimeError("mega_flag_timeout")
+                    # flag ok — fetch this step's token row
+                    tp = ctypes.c_void_p(
+                        st.m_mapdev + 8 * B + j * B * 8)
+                    th = ctypes.c_void_p(st.m_htok.data_ptr())
+                    cu.cuMemcpyDtoHAsync(th, tp, 8 * B, sh)
+                    while cu.cuStreamQuery(ctypes.c_void_p(sh)):
+                        pass
                     _dt = time.perf_counter() - _d0
                     st.t_drain += _dt
                     if j == 4:  # steady-state kernel step time (ms)
                         st.m_kstep_ms = _dt * 1000.0
                     st.m_j = j + 1
+                    toks = st.m_htok.tolist()
                     for b in range(B):
-                        queues[b].append(mv[slot + b])
-                        hists[b].append(mv[slot + b])
+                        queues[b].append(toks[b])
+                        hists[b].append(toks[b])
                     yield [queues[b][i] for b in range(B)]
                     i += 1
                     continue
