@@ -1394,10 +1394,12 @@ class Engine:
                         self._mega_cmp_ms = -1.0
                 if name == "graph_slow" and not (ms < st.decode_ms):
                     self._gerr = 4
-                # mega bench includes a host sync; its real loop never
-                # syncs, so adopt unconditionally once margin-correct
-                if ms < st.decode_ms or (name == "mega_all"
-                                         and st.mega_flag):
+                # adoption must beat the incumbent by 15%: noisy benches
+                # otherwise crown same-speed variants that lose in the
+                # real loop (v94: sdpa bench-won then ran 10.1ms →
+                # latency_limit)
+                if ms < st.decode_ms * 0.85 or (name == "mega_all"
+                                                and st.mega_flag):
                     st.decode_ms = ms
                     st.decode_runner = runner
                     st.decode_name = {
