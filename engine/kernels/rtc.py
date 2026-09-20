@@ -1244,15 +1244,18 @@ class Rtc:
         g = ctypes.c_void_p()
         rc = cu.cuGraphCreate(ctypes.byref(g), 0)
         if rc or not g:
+            self.gn_err = (1, rc)
             raise RuntimeError(f"cuGraphCreate rc={rc}")
         nd = ctypes.c_void_p()
         rc = cu.cuGraphAddKernelNode(
             ctypes.byref(nd), g, None, 0, ctypes.byref(prm))
         if rc or not nd:
+            self.gn_err = (2, rc)
             raise RuntimeError(f"cuGraphAddKernelNode rc={rc}")
         ex = ctypes.c_void_p()
         rc = cu.cuGraphInstantiateWithFlags(ctypes.byref(ex), g, 0)
         if rc or not ex:
+            self.gn_err = (3, rc)
             raise RuntimeError(f"cuGraphInstantiate rc={rc}")
         keep = (arr, args, prm, g, ex)
 
@@ -1260,6 +1263,7 @@ class Rtc:
             stream = torch.cuda.current_stream().cuda_stream
             r = cu.cuGraphLaunch(ex, ctypes.c_void_p(stream))
             if r:
+                self.gn_err = (4, r)
                 raise RuntimeError(f"cuGraphLaunch rc={r}")
         replay._keep = keep
         return replay
@@ -1290,6 +1294,7 @@ class RtcKernels:
         self.megafn = None
         self.gn_ok = False
         self._gn_cache = {}
+        self.gn_err = (0, 0)
         self.megacoop = None
         self.megaclu = None
         self.nblk = torch.cuda.get_device_properties(

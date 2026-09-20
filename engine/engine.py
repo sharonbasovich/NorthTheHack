@@ -1851,8 +1851,11 @@ class Engine:
             var = getattr(self._rtk, "last_variant", 0)
             # 4b decode_name | 3b mega-node probe | 1b gn probe
             mpf = getattr(self, "_mega_probe_flag", None)
-            mpc = (0 if mpf is None else 1 if mpf == -333
-                   else 2 if mpf == 0 else 3)
+            gne = getattr(getattr(self._rtk, "rtc", None),
+                          "gn_err", (0, 0))[0]
+            mpc = (gne + 2 if gne else
+                   (0 if mpf is None else 1 if mpf == -333
+                    else 2))  # 3,4,5,6 = stage fail; 1 ok; 2 flag0
             p = ((getattr(st, "decode_name", 0) & 15)
                  | ((mpc & 7) << 4)
                  | ((getattr(self, "_gn", 0) & 1) << 7))
