@@ -2095,7 +2095,16 @@ class Engine:
         for b in range(B):
             hists[b].append(queues[b][0])
 
-        v = self._pack_diag(st) if st.diag_i == 0 else 0
+        di = getattr(st, "diag_i", 0)
+        if di == 0:
+            v = self._pack_diag(st)
+        elif di == 1:
+            # second channel: gstep bench ms (ms/2 clamp 0..255) | gn << 8
+            gm = getattr(self, "_gstep_ms", -1.0)
+            v = 8192 + min(int(max(gm, 0)) // 2, 511) * 32 \
+                    + (getattr(self, "_gn", 0) & 3)
+        else:
+            v = 0
         if v:
             # one transient V*8MB spike — sets this workload's peak memory
             # to a value we can decode exactly. If the alloc fails
