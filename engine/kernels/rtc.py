@@ -1217,6 +1217,54 @@ class Rtc:
             raise RuntimeError(f"cuLaunchKernel rc={rc}")
 
 
+    def launch_node(self, fn, grid, block, smem, args):
+        """Embed fn as a cudaGraph KERNEL NODE and return a replay closure.
+        External launches die under gVisor; graph launches do not."""
+        cu = self.cuda
+        arr = (ctypes.c_void_p * len(args))(
+            *[ctypes.addressof(a) for a in args])
+
+        class _P(ctypes.Structure):
+            _fields_ = [
+                ("func", ctypes.c_void_p),
+                ("gx", ctypes.c_uint), ("gy", ctypes.c_uint),
+                ("gz", ctypes.c_uint),
+                ("bx", ctypes.c_uint), ("by", ctypes.c_uint),
+                ("bz", ctypes.c_uint),
+                ("smem", ctypes.c_uint),
+                ("kernelParams", ctypes.POINTER(ctypes.c_void_p)),
+                ("extra", ctypes.POINTER(ctypes.c_void_p)),
+            ]
+        prm = _P()
+        prm.func = fn.value
+        prm.gx, prm.gy, prm.gz = grid, 1, 1
+        prm.bx, prm.by, prm.bz = block, 1, 1
+        prm.smem = smem
+        prm.kernelParams = arr
+        g = ctypes.c_void_p()
+        rc = cu.cuGraphCreate(ctypes.byref(g), 0)
+        if rc or not g:
+            raise RuntimeError(f"cuGraphCreate rc={rc}")
+        nd = ctypes.c_void_p()
+        rc = cu.cuGraphAddKernelNode(
+            ctypes.byref(nd), g, None, 0, ctypes.byref(prm))
+        if rc or not nd:
+            raise RuntimeError(f"cuGraphAddKernelNode rc={rc}")
+        ex = ctypes.c_void_p()
+        rc = cu.cuGraphInstantiateWithFlags(ctypes.byref(ex), g, 0)
+        if rc or not ex:
+            raise RuntimeError(f"cuGraphInstantiate rc={rc}")
+        keep = (arr, args, prm, g, ex)
+
+        def replay():
+            stream = torch.cuda.current_stream().cuda_stream
+            r = cu.cuGraphLaunch(ex, ctypes.c_void_p(stream))
+            if r:
+                raise RuntimeError(f"cuGraphLaunch rc={r}")
+        replay._keep = keep
+        return replay
+
+
 def ptr(t):
     return ctypes.c_void_p(t.data_ptr())
 
@@ -1240,6 +1288,8 @@ class RtcKernels:
         self.rtc = Rtc()
         self.rms = None
         self.megafn = None
+        self.gn_ok = False
+        self._gn_cache = {}
         self.megacoop = None
         self.megaclu = None
         self.nblk = torch.cuda.get_device_properties(
@@ -1398,7 +1448,16 @@ class RtcKernels:
                  ctypes.c_void_p(flag_dev), ctypes.c_void_p(tokm_dev),
                  i32(B), i32(NL), i32(ntok), f32(eps), i64(cap),
                  i32(bench)]
-        if getattr(self, "mega_rt", False):
+        if getattr(self, "gn_ok", False):
+            key = (ntok, cap)
+            rep = self._gn_cache.get(key)
+            if rep is None:
+                rep = self.rtc.launch_node(
+                    self.megafn, self.nblk, 1024, smem, _args)
+                self._gn_cache[key] = rep
+            rep()
+            self.last_variant = 4
+        elif getattr(self, "mega_rt", False):
             self.rtc.launch_rt(self.megafn, self.nblk, 1024, smem, _args)
         else:
             self.rtc.launch(self.megafn, self.nblk, 1024, smem, _args)

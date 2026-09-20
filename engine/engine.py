@@ -1248,7 +1248,8 @@ class Engine:
         if self._rtk:
             # mega first: it is the best path when it works and must never
             # be starved by a slow graph-capture attempt ahead of it
-            if False and st.B <= getattr(self._rtk, "nblk", 0):
+            if getattr(self._rtk, "megafn", None) is not None \
+                    and st.B <= getattr(self._rtk, "nblk", 0):
                 candidates.append(("mega_all",
                                    lambda s=st: self._decode_all(s)))
             if getattr(self._rtk, "rms", None) is not None:
@@ -1284,6 +1285,8 @@ class Engine:
         self._gn = getattr(self, "_gn", None)
         if self._gn is None:
             self._gn = self._graphnode_probe(st)
+        if self._rtk and self._gn == 1:
+            self._rtk.gn_ok = True
         self._cand_mask = 0
 
         self._cand_tried = 0
@@ -1750,7 +1753,32 @@ class Engine:
                 cu.cuGraphDestroy(g)
             except Exception:
                 pass
-            return 1 if v == 1234 else 8
+            if v != 1234:
+                return 8
+            # stage 2: can we ALSO capture a cuLaunchKernel call inside a
+            # torch.cuda.graph? If yes, every fused kernel becomes
+            # graph-embeddable without manual node building.
+            self._cl = 1
+            try:
+                rtc = getattr(getattr(self, "_rtk", None), "rtc", None)
+                if rtc is None:
+                    raise RuntimeError("no rtc")
+                out2 = torch.zeros(4, dtype=torch.int32,
+                                   device=st.cur.device)
+                outp2 = ctypes.c_void_p(out2.data_ptr())
+                args = (ctypes.c_void_p * 1)(ctypes.byref(outp2))
+                g2 = torch.cuda.CUDAGraph()
+                _kp = [ctypes.c_void_p(out2.data_ptr())]
+                _pa = (ctypes.c_void_p * 1)(ctypes.byref(_kp[0]))
+                with torch.cuda.graph(g2):
+                    rtc.launch(fn, 1, 32, 0,
+                               [ctypes.c_void_p(out2.data_ptr())])
+                g2.replay()
+                torch.cuda.synchronize()
+                self._cl = 1 if int(out2[0].item()) == 1234 else 3
+            except Exception:
+                self._cl = 2
+            return 1
         except Exception:
             return 9
 
@@ -1797,10 +1825,10 @@ class Engine:
                  | ((getattr(self, "_gn", 0) & 7) << 4)
                  | ((getattr(self, "_leanf_exc", 0) & 3) << 7))
         elif st.B == 4:
-            # 4b decode_name | 3b emitenc | 1b spec enabled
+            # 4b decode_name | 3b capture-launch probe | 1b gn probe
             p = ((getattr(st, "decode_name", 0) & 15)
-                 | ((emitenc & 7) << 4)
-                 | ((1 if getattr(st, "spec_enabled", False) else 0) << 7))
+                 | ((getattr(self, "_cl", 0) & 7) << 4)
+                 | ((getattr(self, "_gn", 0) & 1) << 7))
         elif st.B == 16:
             # 2b decode name, 1b mega adopted, 2b mega bench bucket
             # (0<3ms,1:3-6,2:6-10,3:>10 / never ran), 2b winner bench
@@ -1821,12 +1849,13 @@ class Engine:
             ccode = (0 if cms < 3 else 1 if cms < 6 else 2 if cms < 10
                      else 3)
             var = getattr(self._rtk, "last_variant", 0)
-            # exc: 0 none, 1 Value, 2 Runt, 3 OutMem, 4 Attr, 5 Type,
-            #      6 Index, 7 other — why mega never launched
-            # 4b decode_name | 3b emitenc | 1b spec enabled
+            # 4b decode_name | 3b mega-node probe | 1b gn probe
+            mpf = getattr(self, "_mega_probe_flag", None)
+            mpc = (0 if mpf is None else 1 if mpf == -333
+                   else 2 if mpf == 0 else 3)
             p = ((getattr(st, "decode_name", 0) & 15)
-                 | ((emitenc & 7) << 4)
-                 | ((1 if getattr(st, "spec_enabled", False) else 0) << 7))
+                 | ((mpc & 7) << 4)
+                 | ((getattr(self, "_gn", 0) & 1) << 7))
         else:
             # hidden shapes: 4b decode name | 2b leanf | 2b glean
             p = ((dec & 15)
