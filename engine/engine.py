@@ -529,97 +529,106 @@ class Engine:
         rk = self._rtk
         B = st.B
         if getattr(st, "g_spec", None) is None:
-            self._gstep_ec = 1
-            dev = self.dev
-            bf = torch.bfloat16
-            st.g_x = torch.zeros(B, H, dtype=bf, device=dev)
-            st.g_h = torch.zeros(B, H, dtype=bf, device=dev)
-            st.g_qkv = torch.zeros(B, 48 * D, dtype=bf, device=dev)
-            st.g_qe = torch.zeros(B, NQ * D, dtype=bf, device=dev)
-            st.g_o = torch.zeros(B, NQ * D, dtype=bf, device=dev)
-            st.g_gu = torch.zeros(B, 2 * I, dtype=bf, device=dev)
-            st.g_m = torch.zeros(B, I, dtype=bf, device=dev)
-            st.g_logits = torch.zeros(B, V, dtype=bf, device=dev)
-            st.g_rl = []
-            st.g_spec = []
-            import ctypes
+            try:
+                self._gstep_build_inner(st)
+            except Exception:
+                st.g_spec = None
+                raise
+        return
 
-            def P(t):
-                return ctypes.c_void_p(t.data_ptr())
+    def _gstep_build_inner(self, st) -> None:
+        rk = self._rtk
+        B = st.B
+        self._gstep_ec = 1
 
-            def I32(v):
-                return ctypes.c_int(v)
+        dev = self.dev
+        bf = torch.bfloat16
+        st.g_x = torch.zeros(B, H, dtype=bf, device=dev)
+        st.g_h = torch.zeros(B, H, dtype=bf, device=dev)
+        st.g_qkv = torch.zeros(B, 48 * D, dtype=bf, device=dev)
+        st.g_qe = torch.zeros(B, NQ * D, dtype=bf, device=dev)
+        st.g_o = torch.zeros(B, NQ * D, dtype=bf, device=dev)
+        st.g_gu = torch.zeros(B, 2 * I, dtype=bf, device=dev)
+        st.g_m = torch.zeros(B, I, dtype=bf, device=dev)
+        st.g_logits = torch.zeros(B, V, dtype=bf, device=dev)
+        st.g_rl = []
+        st.g_spec = []
+        import ctypes
 
-            def I64(v):
-                return ctypes.c_longlong(v)
+        def P(t):
+            return ctypes.c_void_p(t.data_ptr())
 
-            def F32(v):
-                return ctypes.c_float(v)
-            gf = rk.gf
+        def I32(v):
+            return ctypes.c_int(v)
+
+        def I64(v):
+            return ctypes.c_longlong(v)
+
+        def F32(v):
+            return ctypes.c_float(v)
+        gf = rk.gf
+        nodes = []
+        # embed: x = emb[cur]
+        nodes.append((gf["embed_k"], (B * H + 255) // 256, 256, 0,
+                      [P(self.embed_w), P(st.cur), P(st.g_x),
+                       I32(H), I32(B)]))
+        st.g_spec.append(list(nodes))
+        self._gstep_ec = 2
+        for i, w in enumerate(self.layers):
             nodes = []
-            # embed: x = emb[cur]
-            nodes.append((gf["embed_k"], (B * H + 255) // 256, 256, 0,
-                          [P(self.embed_w), P(st.cur), P(st.g_x),
-                           I32(H), I32(B)]))
+            # h = rms(x)
+            nodes.append((gf["rms_k"], B, 256, 0,
+                          [P(st.g_x), P(w["ln_in"]), P(st.g_h),
+                           I32(H), I32(B), F32(EPS)]))
+            # qkv = h @ wqkv.T
+            nodes.append((gf["gemv_k"], B * (48 * D // 8), 256, 0,
+                          [P(st.g_h), P(w["wqkv"]), P(st.g_qkv),
+                           I32(H), I32(48 * D), I32(B)]))
+            # q/k norm+rope, kv store -> g_qe
+            nodes.append((gf["rope_kv_k"], B * (NQ + NKV), 128, 0,
+                          [P(st.g_qkv), P(w["qn"]), P(w["kn"]),
+                           P(st.cos), P(st.sin), P(st.pos),
+                           P(st.g_qe), P(st.kc[i]), P(st.vc[i]),
+                           I32(st.S), I32(NQ), I32(NKV), I32(D),
+                           F32(EPS)]))
+            # attention -> g_o
+            nodes.append((gf["attn_k"], B * NKV, 128, 0,
+                          [P(st.g_qe), P(st.kc[i]), P(st.vc[i]),
+                           P(st.pos), P(st.g_o),
+                           I32(st.S), I32(NKV), I32(GROUP), I32(D),
+                           I32(B), F32(SCALE)]))
+            # x += g_o @ wo.T
+            nodes.append((gf["gemv_add_k"], B * (H // 8), 256, 0,
+                          [P(st.g_o), P(w["wo"]), P(st.g_x),
+                           I32(NQ * D), I32(H), I32(B)]))
+            # h2 = rms(x, ln_post) -> reuse g_h
+            nodes.append((gf["rms_k"], B, 256, 0,
+                          [P(st.g_x), P(w["ln_post"]), P(st.g_h),
+                           I32(H), I32(B), F32(EPS)]))
+            # m = silu(h2@wgu.gate) * (h2@wgu.up) — fused pair gemv
+            nodes.append((gf["gemv_silu_k"], B * (I // 8), 256, 0,
+                          [P(st.g_h), P(w["wgu"]), P(st.g_m),
+                           I32(H), I32(I), I32(B)]))
+            # x += m @ wd.T
+            nodes.append((gf["gemv_add_k"], B * (H // 8), 256, 0,
+                          [P(st.g_m), P(w["wd"]), P(st.g_x),
+                           I32(I), I32(H), I32(B)]))
             st.g_spec.append(list(nodes))
-            self._gstep_ec = 2
-            for i, w in enumerate(self.layers):
-                nodes = []
-                # h = rms(x)
-                nodes.append((gf["rms_k"], B, 256, 0,
-                              [P(st.g_x), P(w["ln_in"]), P(st.g_h),
-                               I32(H), I32(B), F32(EPS)]))
-                # qkv = h @ wqkv.T
-                nodes.append((gf["gemv_k"], B * (48 * D // 8), 256, 0,
-                              [P(st.g_h), P(w["wqkv"]), P(st.g_qkv),
-                               I32(H), I32(48 * D), I32(B)]))
-                # q/k norm+rope, kv store -> g_qe
-                nodes.append((gf["rope_kv_k"], B * (NQ + NKV), 128, 0,
-                              [P(st.g_qkv), P(w["qn"]), P(w["kn"]),
-                               P(st.cos), P(st.sin), P(st.pos),
-                               P(st.g_qe), P(st.kc[i]), P(st.vc[i]),
-                               I32(st.S), I32(NQ), I32(NKV), I32(D),
-                               F32(EPS)]))
-                # attention -> g_o
-                nodes.append((gf["attn_k"], B * NKV, 128, 0,
-                              [P(st.g_qe), P(st.kc[i]), P(st.vc[i]),
-                               P(st.pos), P(st.g_o),
-                               I32(st.S), I32(NKV), I32(GROUP), I32(D),
-                               I32(B), F32(SCALE)]))
-                # x += g_o @ wo.T
-                nodes.append((gf["gemv_add_k"], B * (H // 8), 256, 0,
-                              [P(st.g_o), P(w["wo"]), P(st.g_x),
-                               I32(NQ * D), I32(H), I32(B)]))
-                # h2 = rms(x, ln_post) -> reuse g_h
-                nodes.append((gf["rms_k"], B, 256, 0,
-                              [P(st.g_x), P(w["ln_post"]), P(st.g_h),
-                               I32(H), I32(B), F32(EPS)]))
-                # m = silu(h2@wgu.gate) * (h2@wgu.up) — fused pair gemv
-                nodes.append((gf["gemv_silu_k"], B * (I // 8), 256, 0,
-                              [P(st.g_h), P(w["wgu"]), P(st.g_m),
-                               I32(H), I32(I), I32(B)]))
-                # x += m @ wd.T
-                nodes.append((gf["gemv_add_k"], B * (H // 8), 256, 0,
-                              [P(st.g_m), P(w["wd"]), P(st.g_x),
-                               I32(I), I32(H), I32(B)]))
-                st.g_spec.append(list(nodes))
-                self._gstep_ec = min(6, 3 + (i >> 4))
-            # tail: final rms -> g_h; logits gemv; argmax+pos
-            tail = [
-                (gf["rms_k"], B, 256, 0,
-                 [P(st.g_x), P(self.fin_w), P(st.g_h),
-                  I32(H), I32(B), F32(EPS)]),
-                (gf["gemv_k"], B * (V // 8), 256, 0,
-                 [P(st.g_h), P(self.lm_w), P(st.g_logits),
-                  I32(H), I32(V), I32(B)]),
-                (gf["argmax_pos_k"], B, 256, 0,
-                 [P(st.g_logits), P(st.cur), P(st.pos),
-                  I32(V), I32(B)]),
-            ]
-            st.g_spec.append(list(tail))
-        for rp in st.g_rl:
-            rp()
-        self._last_logits = st.g_logits
+            self._gstep_ec = min(6, 3 + (i >> 4))
+        # tail: final rms -> g_h; logits gemv; argmax+pos
+        tail = [
+            (gf["rms_k"], B, 256, 0,
+             [P(st.g_x), P(self.fin_w), P(st.g_h),
+              I32(H), I32(B), F32(EPS)]),
+            (gf["gemv_k"], B * (V // 8), 256, 0,
+             [P(st.g_h), P(self.lm_w), P(st.g_logits),
+              I32(H), I32(V), I32(B)]),
+            (gf["argmax_pos_k"], B, 256, 0,
+             [P(st.g_logits), P(st.cur), P(st.pos),
+              I32(V), I32(B)]),
+        ]
+        st.g_spec.append(list(tail))
+        self._gstep_ec = 7
 
     def _decode_step_gstep(self, st: _State) -> None:
         self._gstep_build(st)
@@ -1449,6 +1458,18 @@ class Engine:
                             -1, st.cur[:, 0:1]).reshape(-1)
                         st.gk_gap = int(min(15, max(0, float(
                             (mxv - selv).max().item()) * 2)))
+                        # logits-space diff: how far off are the raw values?
+                        try:
+                            lg = st.g_logits.reshape(st.B, -1).float()
+                            rf = ref_logits.reshape(st.B, -1).float()
+                            st.gk_ld = int(min(15, max(0, float(
+                                (lg - rf).abs().max().item()) * 2)))
+                            # my argmax vs ref argmax same token?
+                            st.gk_am = int((lg.argmax(-1)
+                                          == rf.argmax(-1)).float()
+                                          .mean().item() * 3)
+                        except Exception:
+                            st.gk_ld = 15; st.gk_am = 0
                         st.gk_tok = int(st.cur.reshape(-1)[0].item() % 63)
                         st.gk_ref = int(ref_logits.reshape(st.B, -1)
                                         .argmax(-1).reshape(-1)[0].item() % 63)
@@ -1960,13 +1981,13 @@ class Engine:
             # 4b decode_name | 4b gk margin gap(x2 clamp15) | 2b gn probe
             p = ((getattr(st, "decode_name", 0) & 15)
                  | ((getattr(st, "gk_gap", 15) & 15) << 4)
-                 | ((getattr(self, "_gn", 0) & 3) << 8))
+                 | ((getattr(st, "gk_am", 0) & 3) << 8))
         elif st.B == 4:
             # 4b decode_name | 4b gdirect ms(0.5ms clamp15) | 2b gn probe
             gms = getattr(self, "_gdir_ms", -1.0)
             gc = 15 if gms < 0 else min(14, int(gms * 2))
             p = ((getattr(st, "decode_name", 0) & 15)
-                 | ((gc & 15) << 4)
+                 | ((getattr(st, "gk_ld", 15) & 15) << 4)
                  | ((getattr(self, "_gn", 0) & 3) << 8))
         elif st.B == 16:
             # 2b decode name, 1b mega adopted, 2b mega bench bucket
