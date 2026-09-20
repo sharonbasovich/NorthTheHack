@@ -1274,6 +1274,12 @@ class Engine:
                         restore()
                     except Exception:
                         self._mega_bar_ms = -1.0
+                    try:
+                        self._mega_cmp_ms = self._bench(
+                            lambda: self._decode_all(st, 1, 2))
+                        restore()
+                    except Exception:
+                        self._mega_cmp_ms = -1.0
                 if name == "graph_slow" and not (ms < st.decode_ms):
                     self._gerr = 4
                 # mega bench includes a host sync; its real loop never
@@ -1584,9 +1590,12 @@ class Engine:
             bms = getattr(self, "_mega_bar_ms", -1.0)
             bcode = (0 if bms < 3 else 1 if bms < 6 else 2 if bms < 10
                      else 3)
+            cms = getattr(self, "_mega_cmp_ms", -1.0)
+            ccode = (0 if cms < 3 else 1 if cms < 6 else 2 if cms < 10
+                     else 3)
             p = ((dec & 3)
                  | ((getattr(self, "_mega_adopted", 0) & 1) << 2)
-                 | (kcode << 3) | (mcode << 5))
+                 | (bcode << 3) | (ccode << 5))
         else:
             p = (dec & 7) | (emitenc << 3)
         # spike must exceed the workload's own peak (~16GB seen), so the

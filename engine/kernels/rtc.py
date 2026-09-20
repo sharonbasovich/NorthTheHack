@@ -873,13 +873,15 @@ extern "C" __global__ void step_all_k(
     int nwl = per * (NT / 32);
     int gwl = loc * (NT / 32) + (tid >> 5);
 
-    if (bench) {
+    if (bench == 1) {
         for (int s = 0; s < ntok; ++s) {
             for (int i = 0; i < NL * 6 + 4; ++i) gbar(gcnt, ggen);
             if (loc == 0 && tid == 0) flag[b] = (long long)(s + 1);
         }
         return;
     }
+    int nobar = (bench == 2);
+#define GB() do { if (!nobar) gbar(gcnt, ggen); } while (0)
 
     bf16* hidb = hid + (long long)b * HDIM;
     bf16* qkvb = qkv + (long long)b * QKVD;
@@ -894,7 +896,7 @@ extern "C" __global__ void step_all_k(
         const bf16* e = embed + tok * (long long)HDIM;
         for (int i = tid; i < HDIM; i += NT) hidb[i] = e[i];
     }
-    gbar(gcnt, ggen);
+    GB();
 
     for (int l = 0; l < NL; ++l) {
         const bf16* w_ln_in = (const bf16*)lw[l * 10 + 0];
@@ -910,35 +912,35 @@ extern "C" __global__ void step_all_k(
 
         if (loc == 0) rms_row(hidb, w_ln_in, h + (long long)b * HDIM,
                               eps, red);
-        gbar(gcnt, ggen);
+        GB();
         gemv_g(wqkv, h + (long long)b * HDIM, qkvb, QKVD, HDIM, 0, 0,
                0, gwl, nwl);
-        gbar(gcnt, ggen);
+        GB();
         if (loc < 8) {
             attn_unit(b, loc, qkvb, wqn, wkn,
                       cost, sint, kcb, vcb, pos[b],
                       obuf, cap, 1.0f / 11.313708499f, eps,
                       red, srope, scores);
         }
-        gbar(gcnt, ggen);
+        GB();
         gemv_g(wo, obufb, hidb, HDIM, ODIM, hidb, 0, 0, gwl, nwl);
-        gbar(gcnt, ggen);
+        GB();
         if (loc == 0) rms_row(hidb, w_ln2, h2 + (long long)b * HDIM,
                               eps, red);
-        gbar(gcnt, ggen);
+        GB();
         gemv_g(wgu, h2 + (long long)b * HDIM, gub, GDIM, HDIM, 0, 0,
                0, gwl, nwl);
-        gbar(gcnt, ggen);
+        GB();
         gemv_g(wd, 0, hidb, HDIM, IDIM, hidb, gub, 1, gwl, nwl);
-        gbar(gcnt, ggen);
+        GB();
     }
 
     if (loc == 0) rms_row(hidb, finw, h + (long long)b * HDIM, eps,
                           red);
-    gbar(gcnt, ggen);
+    GB();
     gemv_gf(embed, h + (long long)b * HDIM, logb, VDIM, HDIM,
             gwl, nwl);
-    gbar(gcnt, ggen);
+    GB();
 
     // argmax over logits[b]: group-local slice scan, scratch reduce,
     // loc==0 reduces slice winners.
@@ -973,7 +975,7 @@ extern "C" __global__ void step_all_k(
             }
         }
     }
-    gbar(gcnt, ggen);
+    GB();
     if (loc == 0 && tid == 0) {
         float mv = -3.402823466e+38f;
         int mi = VDIM;
@@ -987,7 +989,7 @@ extern "C" __global__ void step_all_k(
         pos[b] += 1;
         __threadfence_system();
     }
-    gbar(gcnt, ggen);
+    GB();
     if (loc == 0 && tid == 0) flag[b] = (long long)(step_i + 1);
     }
 }
