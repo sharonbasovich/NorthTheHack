@@ -210,6 +210,10 @@ class _State:
         self.spec_runner = None      # verify pass runner (graph or eager)
         self.spec_ms = float("inf")
         self.spec_enabled = False
+        # speculative verify is a net loss at ~26us/kernel dispatch
+        # (measured 330 vs 478 baseline on v87) — leave off until the
+        # verify pass itself gets cheaper
+        self._spec_on = False
         self.pre_graph = None        # whole-prefill graph
         self.ids_dev = None          # [B, L] graph input for prefill replay
         self.first_dev = None        # [B] argmax output of captured prefill
@@ -1358,8 +1362,11 @@ class Engine:
         st.inp.fill_(0)
         st.inp[:, 0] = c0[:, 0]
         ref_logits_b = None
-        self._batch_err = 15   # 15 = threw inside the step call itself
+        self._batch_err = 0
         try:
+            if not self._spec_on:
+                raise _SkipSpec()
+            self._batch_err = 15   # 15 = threw inside the step call itself
             self._decode_step_slow_batch(st)
             self._batch_err = 1
             ref_logits_b = self._last_logits_b.clone().view(st.B, R, V)
@@ -1475,7 +1482,8 @@ class Engine:
                 except Exception as e:
                     self._dbg("spec %s err %s" % (make, repr(e)[:160]))
                     restore()
-        st.spec_enabled = st.spec_runner is not None
+        st.spec_enabled = (
+            self._spec_on and st.spec_runner is not None)
         st.spec_window = []
         self._choose_path = 6
         try:
