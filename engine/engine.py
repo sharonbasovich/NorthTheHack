@@ -1364,7 +1364,7 @@ class Engine:
         ref_logits_b = None
         self._batch_err = 0
         try:
-            if not self._spec_on:
+            if not st._spec_on:
                 raise _SkipSpec()
             self._batch_err = 15   # 15 = threw inside the step call itself
             self._decode_step_slow_batch(st)
@@ -1482,8 +1482,8 @@ class Engine:
                 except Exception as e:
                     self._dbg("spec %s err %s" % (make, repr(e)[:160]))
                     restore()
-        st.spec_enabled = (
-            self._spec_on and st.spec_runner is not None)
+        # spec_runner is only set when st._spec_on allowed the gate to run
+        st.spec_enabled = st.spec_runner is not None
         st.spec_window = []
         self._choose_path = 6
         try:
