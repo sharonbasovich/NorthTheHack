@@ -522,12 +522,14 @@ class Engine:
         if getattr(st, "m_lw", None) is None:
             B, dev = st.B, self.dev
             lw = []
+            self._mega_stage = 1
             for i, w in enumerate(self.layers):
                 lw += [w["ln_in"].data_ptr(), w["wqkv"].data_ptr(),
                        w["qn"].data_ptr(), w["kn"].data_ptr(),
                        w["wo"].data_ptr(), w["ln_post"].data_ptr(),
                        w["wgu"].data_ptr(), w["wd"].data_ptr(),
                        st.kc[i].data_ptr(), st.vc[i].data_ptr()]
+            self._mega_stage = 2
             st.m_lw = torch.tensor(lw, dtype=torch.int64, device=dev)
             st.m_hid = torch.empty(B, H, dtype=torch.bfloat16, device=dev)
             st.m_hbuf = torch.empty(B, 2 * H, dtype=torch.bfloat16,
@@ -546,10 +548,13 @@ class Engine:
                                      device=dev)
             st.m_cnt = torch.zeros(B, dtype=torch.int32, device=dev)
             st.m_gen = torch.zeros(B, dtype=torch.int32, device=dev)
+            self._mega_stage = 3
             # host-mapped: B per-group flag words + tokcap slots of B each
             st.m_tokcap = 512
             st.m_map, st.m_mapdev = rk.host_map(
                 8 * B + st.m_tokcap * B * 8)
+            self._mega_stage = 4
+        self._mega_stage = 5
         rk.step_all(st.m_lw, self.embed_w, self.fin_w, st.cos, st.sin,
                     st.pos, st.cur, st.m_hid, st.m_hbuf, st.m_qkv,
                     st.m_obuf, st.m_gu, st.m_logits, st.m_amaxv,
@@ -1579,11 +1584,12 @@ class Engine:
             # bits: 0-2 mega exc class, 3 mega_flag, 4 adopted,
             # 5-6 variant, 7-9 rtc_status
             var4 = getattr(self._rtk, "last_variant", 0)
+            stg = getattr(self, "_mega_stage", 0)
             p = ((getattr(self, "_mega_exc", 0) & 7)
                  | ((getattr(st, "mega_flag", False) & 1) << 3)
                  | ((getattr(self, "_mega_adopted", 0) & 1) << 4)
                  | ((var4 & 3) << 5)
-                 | ((getattr(self, "_rtc_status", 0) & 7) << 7))
+                 | ((stg & 7) << 7))
         elif st.B == 16:
             # 2b decode name, 1b mega adopted, 2b mega bench bucket
             # (0<3ms,1:3-6,2:6-10,3:>10 / never ran), 2b winner bench
@@ -1607,10 +1613,11 @@ class Engine:
             # exc: 0 none, 1 Value, 2 Runt, 3 OutMem, 4 Attr, 5 Type,
             #      6 Index, 7 other — why mega never launched
             exc = getattr(self, "_mega_exc", 0)
+            stage = getattr(self, "_mega_stage", 0)
             # variant: 0 none, 1 cluster, 2 coop, 3 software
             p = ((exc & 7)
                  | ((getattr(self, "_mega_adopted", 0) & 1) << 3)
-                 | ((var & 3) << 4) | (bcode << 6))
+                 | ((var & 3) << 4) | ((stage & 15) << 6))
         else:
             p = (dec & 7) | (emitenc << 3)
         # spike must exceed the workload's own peak (~16GB seen), so the
