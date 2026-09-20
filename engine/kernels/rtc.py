@@ -1399,11 +1399,16 @@ class RtcKernels:
         self.gf = {}
         try:
             import base64
-            from kernels.gstepcub import GSTEP_PTX_B64
             gmod = ctypes.c_void_p()
+            blob = None
+            try:
+                from kernels.gstepcub import GSTEP_CUBIN_B64
+                blob = base64.b64decode(GSTEP_CUBIN_B64)
+            except ImportError:
+                from kernels.gstepcub import GSTEP_PTX_B64
+                blob = base64.b64decode(GSTEP_PTX_B64)
             rc = self.rtc.cuda.cuModuleLoadData(
-                ctypes.byref(gmod), ctypes.c_char_p(
-                    base64.b64decode(GSTEP_PTX_B64)))
+                ctypes.byref(gmod), ctypes.c_char_p(blob))
             self.gf_err = rc if rc else 8
             if rc == 0 and gmod:
                 for ni, nm in enumerate(
