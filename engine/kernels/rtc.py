@@ -901,7 +901,7 @@ extern "C" __global__ void step_all_k(
         if (loc < 8) {
             attn_unit(b, loc, qkvb, wqn, wkn,
                       cost, sint, kcb, vcb, pos[b],
-                      obufb, cap, 1.0f / 11.313708499f, eps,
+                      obuf, cap, 1.0f / 11.313708499f, eps,
                       red, srope, scores);
         }
         gbar(gcnt, ggen);
