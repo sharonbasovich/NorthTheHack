@@ -1388,7 +1388,17 @@ class Engine:
             candidates.append(("jit", "jit"))
         self._gn = getattr(self, "_gn", None)
         if self._gn is None:
-            self._gn = self._graphnode_probe(st)
+            # flaky-under-gvisor: cache verdict across workload processes
+            try:
+                with open("/tmp/devin_gn_verdict") as fh:
+                    self._gn = int(fh.read().strip())
+            except Exception:
+                self._gn = self._graphnode_probe(st)
+                try:
+                    with open("/tmp/devin_gn_verdict", "w") as fh:
+                        fh.write(str(self._gn))
+                except Exception:
+                    pass
         if self._rtk and self._gn == 1:
             self._rtk.gn_ok = True
         self._cand_mask = 0
