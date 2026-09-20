@@ -1269,6 +1269,67 @@ class Rtc:
         return replay
 
 
+    def build_node_graph(self, node_specs):
+        """node_specs: list of (fn, grid, block, smem, [args]) — each node
+        depends on the previous (strict sequence). Returns replay()."""
+        cu = self.cuda
+
+        class _P(ctypes.Structure):
+            _fields_ = [
+                ("func", ctypes.c_void_p),
+                ("gx", ctypes.c_uint), ("gy", ctypes.c_uint),
+                ("gz", ctypes.c_uint),
+                ("bx", ctypes.c_uint), ("by", ctypes.c_uint),
+                ("bz", ctypes.c_uint),
+                ("smem", ctypes.c_uint),
+                ("kernelParams", ctypes.POINTER(ctypes.c_void_p)),
+                ("extra", ctypes.POINTER(ctypes.c_void_p)),
+            ]
+        g = ctypes.c_void_p()
+        rc = cu.cuGraphCreate(ctypes.byref(g), 0)
+        if rc or not g:
+            self.gn_err = (1, rc)
+            raise RuntimeError(f"cuGraphCreate rc={rc}")
+        prev = None
+        keeps = []
+        for (fn, grid, block, smem, args) in node_specs:
+            arr = (ctypes.c_void_p * len(args))(
+                *[ctypes.addressof(a) for a in args])
+            prm = _P()
+            prm.func = fn.value
+            prm.gx, prm.gy, prm.gz = grid, 1, 1
+            prm.bx, prm.by, prm.bz = block, 1, 1
+            prm.smem = smem
+            prm.kernelParams = arr
+            nd = ctypes.c_void_p()
+            if prev is None:
+                rc = cu.cuGraphAddKernelNode(
+                    ctypes.byref(nd), g, None, 0, ctypes.byref(prm))
+            else:
+                darr = (ctypes.c_void_p * 1)(prev)
+                rc = cu.cuGraphAddKernelNode(
+                    ctypes.byref(nd), g, darr, 1, ctypes.byref(prm))
+            if rc or not nd:
+                self.gn_err = (2, rc)
+                raise RuntimeError(f"cuGraphAddKernelNode rc={rc}")
+            prev = nd
+            keeps.append((arr, args, prm))
+        ex = ctypes.c_void_p()
+        rc = cu.cuGraphInstantiateWithFlags(ctypes.byref(ex), g, 0)
+        if rc or not ex:
+            self.gn_err = (3, rc)
+            raise RuntimeError(f"cuGraphInstantiate rc={rc}")
+
+        def replay():
+            stream = torch.cuda.current_stream().cuda_stream
+            r = cu.cuGraphLaunch(ex, ctypes.c_void_p(stream))
+            if r:
+                self.gn_err = (4, r)
+                raise RuntimeError(f"cuGraphLaunch rc={r}")
+        replay._keep = (keeps, g, ex)
+        return replay
+
+
 def ptr(t):
     return ctypes.c_void_p(t.data_ptr())
 
@@ -1333,6 +1394,27 @@ class RtcKernels:
             self.mega_rt = False
             self.megafn = self.rtc.load_cubin(_raw, "step_all_k")
             self.cub_path = True
+        # fused-step kernels: embedded PTX loaded via cuModuleLoadData
+        self.gf = {}
+        try:
+            import base64
+            from kernels.gstepcub import GSTEP_PTX_B64
+            gmod = ctypes.c_void_p()
+            rc = self.rtc.cuda.cuModuleLoadData(
+                ctypes.byref(gmod), ctypes.c_char_p(
+                    base64.b64decode(GSTEP_PTX_B64)))
+            if rc == 0 and gmod:
+                for nm in ("embed_k", "rms_k", "gemv_k", "gemv_add_k",
+                           "rope_kv_k", "attn_k", "silu_k",
+                           "argmax_pos_k"):
+                    f = ctypes.c_void_p()
+                    rc = self.rtc.cuda.cuModuleGetFunction(
+                        ctypes.byref(f), gmod, nm.encode())
+                    if rc or not f:
+                        raise RuntimeError(f"missing {nm} rc={rc}")
+                    self.gf[nm] = f
+        except Exception as _e:
+            self.gf = {}
 
     @property
     def ok(self):

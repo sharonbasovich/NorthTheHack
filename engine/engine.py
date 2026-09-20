@@ -524,6 +524,100 @@ class Engine:
         st.cur.copy_(tok.view(B, 1))
         st.pos.add_(1)
 
+
+    def _decode_step_gstep(self, st: _State) -> None:
+        """Whole decode step as ONE driver graph of custom kernel nodes —
+        ~330 sequential nodes, zero host dispatch per token."""
+        rk = self._rtk
+        B = st.B
+        if getattr(st, "g_replay", None) is None:
+            dev = self.dev
+            bf = torch.bfloat16
+            st.g_x = torch.zeros(B, H, dtype=bf, device=dev)
+            st.g_h = torch.zeros(B, H, dtype=bf, device=dev)
+            st.g_qkv = torch.zeros(B, 48 * D, dtype=bf, device=dev)
+            st.g_qe = torch.zeros(B, NQ * D, dtype=bf, device=dev)
+            st.g_o = torch.zeros(B, NQ * D, dtype=bf, device=dev)
+            st.g_gu = torch.zeros(B, 2 * I, dtype=bf, device=dev)
+            st.g_m = torch.zeros(B, I, dtype=bf, device=dev)
+            st.g_logits = torch.zeros(B, V, dtype=bf, device=dev)
+            import ctypes
+
+            def P(t):
+                return ctypes.c_void_p(t.data_ptr())
+
+            def I32(v):
+                return ctypes.c_int(v)
+
+            def I64(v):
+                return ctypes.c_longlong(v)
+
+            def F32(v):
+                return ctypes.c_float(v)
+            gf = rk.gf
+            nodes = []
+            # embed: x = emb[cur]
+            nodes.append((gf["embed_k"], (B * H + 255) // 256, 256, 0,
+                          [P(self.embed_w), P(st.cur), P(st.g_x),
+                           I32(H), I32(B)]))
+            for i, w in enumerate(self.layers):
+                # h = rms(x)
+                nodes.append((gf["rms_k"], B, 256, 0,
+                              [P(st.g_x), P(w["ln_in"]), P(st.g_h),
+                               I32(H), I32(B), F32(EPS)]))
+                # qkv = h @ wqkv.T
+                nodes.append((gf["gemv_k"], B * (48 * D // 8), 256, 0,
+                              [P(st.g_h), P(w["wqkv"]), P(st.g_qkv),
+                               I32(H), I32(48 * D), I32(B)]))
+                # q/k norm+rope, kv store -> g_qe
+                nodes.append((gf["rope_kv_k"], B * (NQ + NKV), 128, 0,
+                              [P(st.g_qkv), P(w["qn"]), P(w["kn"]),
+                               P(st.cos), P(st.sin), P(st.pos),
+                               P(st.g_qe), P(st.kc[i]), P(st.vc[i]),
+                               I32(st.S), I32(NQ), I32(NKV), I32(D),
+                               F32(EPS)]))
+                # attention -> g_o
+                nodes.append((gf["attn_k"], B * NKV, 128, 0,
+                              [P(st.g_qe), P(st.kc[i]), P(st.vc[i]),
+                               P(st.pos), P(st.g_o),
+                               I32(st.S), I32(NKV), I32(GROUP), I32(D),
+                               I32(B), F32(SCALE)]))
+                # x += g_o @ wo.T
+                nodes.append((gf["gemv_add_k"], B * (H // 8), 256, 0,
+                              [P(st.g_o), P(w["wo"]), P(st.g_x),
+                               I32(NQ * D), I32(H), I32(B)]))
+                # h2 = rms(x, ln_post) -> reuse g_h
+                nodes.append((gf["rms_k"], B, 256, 0,
+                              [P(st.g_x), P(w["ln_post"]), P(st.g_h),
+                               I32(H), I32(B), F32(EPS)]))
+                # gu = h2 @ wgu.T
+                nodes.append((gf["gemv_k"], B * (2 * I // 8), 256, 0,
+                              [P(st.g_h), P(w["wgu"]), P(st.g_gu),
+                               I32(H), I32(2 * I), I32(B)]))
+                # m = silu(gu[:I])*gu[I:]
+                nodes.append((gf["silu_k"], (B * I + 255) // 256, 256, 0,
+                              [P(st.g_gu), P(st.g_m), I32(I), I32(B)]))
+                # x += m @ wd.T
+                nodes.append((gf["gemv_add_k"], B * (H // 8), 256, 0,
+                              [P(st.g_m), P(w["wd"]), P(st.g_x),
+                               I32(I), I32(H), I32(B)]))
+            # final rms -> reuse g_h
+            nodes.append((gf["rms_k"], B, 256, 0,
+                          [P(st.g_x), P(self.fin_w), P(st.g_h),
+                           I32(H), I32(B), F32(EPS)]))
+            # logits = h @ lm.T  (bf16 like reference)
+            nodes.append((gf["gemv_k"], B * (V // 8), 256, 0,
+                          [P(st.g_h), P(self.lm_w), P(st.g_logits),
+                           I32(H), I32(V), I32(B)]))
+            # cur = argmax(logits); pos += 1
+            nodes.append((gf["argmax_pos_k"], B, 256, 0,
+                          [P(st.g_logits), P(st.cur), P(st.pos),
+                           I32(V), I32(B)]))
+            st.g_replay = rk.rtc.build_node_graph(nodes)
+            self._gstep_nodes = len(nodes)
+        st.g_replay()
+        self._last_logits = st.g_logits
+
     def _decode_step_rtc(self, st: _State) -> None:
         """Decode step on NVRTC-compiled fused kernels: ~9 CUDA launches
         per layer instead of ~30. Numerics replicated exactly (see
@@ -1270,6 +1364,9 @@ class Engine:
                            lambda s=st: self._decode_step_lean(s, False)))
         candidates.append(("eager_lean",
                            lambda s=st: self._decode_step_lean(s, True)))
+        if self._rtk and getattr(self._rtk, "gf", None):
+            candidates.append(("gstep",
+                               lambda s=st: self._decode_step_gstep(s)))
         if self._probe("graph"):
             candidates.append(("graph_lean", self._decode_step_lean))
         if self._probe("toolchain"):
@@ -1311,7 +1408,8 @@ class Engine:
                     runner = mod.step
                 elif name in ("eager_fast", "eager_rms", "eager_sdpa",
                               "eager_lean", "eager_leanr",
-                              "eager_rtc", "eager_rtc2", "mega_all"):
+                              "eager_rtc", "eager_rtc2", "mega_all",
+                              "gstep"):
                     runner = what
                     if name == "mega_all":
                         # bisect: bench=3 exercises launch+probe+flag only;
@@ -1394,7 +1492,8 @@ class Engine:
                     "compile": 6, "mega_all": 7, "eager_rtc": 8,
                     "eager_rtc2": 9, "eager_sdpa": 10,
                     "eager_leanr": 12, "eager_lean": 13,
-                    "graph_lean": 14}.get(name, 11)
+                    "graph_lean": 14,
+                    "gstep": 15}.get(name, 11)
                 ms = self._bench(runner)
                 restore()
                 if name == "eager_sdpa":
@@ -1428,7 +1527,7 @@ class Engine:
                         "jit": 4, "compile": 5, "ext": 6, "eager_rms": 7,
                         "eager_sdpa": 5, "eager_rtc": 3, "eager_rtc2": 4,
                         "mega_all": 8, "eager_leanr": 9, "eager_lean": 10,
-                        "graph_lean": 11,
+                        "graph_lean": 11, "gstep": 15,
                     }[name]
                     if name == "mega_all":
                         self._mega_adopted = 1
