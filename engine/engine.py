@@ -541,6 +541,7 @@ class Engine:
             st.g_gu = torch.zeros(B, 2 * I, dtype=bf, device=dev)
             st.g_m = torch.zeros(B, I, dtype=bf, device=dev)
             st.g_logits = torch.zeros(B, V, dtype=bf, device=dev)
+            st.g_rl = []          # list of replay closures, in order
             import ctypes
 
             def P(t):
@@ -555,12 +556,15 @@ class Engine:
             def F32(v):
                 return ctypes.c_float(v)
             gf = rk.gf
+            rl = st.g_rl
             nodes = []
             # embed: x = emb[cur]
             nodes.append((gf["embed_k"], (B * H + 255) // 256, 256, 0,
                           [P(self.embed_w), P(st.cur), P(st.g_x),
                            I32(H), I32(B)]))
+            rl.append(rk.rtc.build_node_graph(nodes))
             for i, w in enumerate(self.layers):
+                nodes = []
                 # h = rms(x)
                 nodes.append((gf["rms_k"], B, 256, 0,
                               [P(st.g_x), P(w["ln_in"]), P(st.g_h),
@@ -601,21 +605,23 @@ class Engine:
                 nodes.append((gf["gemv_add_k"], B * (H // 8), 256, 0,
                               [P(st.g_m), P(w["wd"]), P(st.g_x),
                                I32(I), I32(H), I32(B)]))
-            # final rms -> reuse g_h
-            nodes.append((gf["rms_k"], B, 256, 0,
-                          [P(st.g_x), P(self.fin_w), P(st.g_h),
-                           I32(H), I32(B), F32(EPS)]))
-            # logits = h @ lm.T  (bf16 like reference)
-            nodes.append((gf["gemv_k"], B * (V // 8), 256, 0,
-                          [P(st.g_h), P(self.lm_w), P(st.g_logits),
-                           I32(H), I32(V), I32(B)]))
-            # cur = argmax(logits); pos += 1
-            nodes.append((gf["argmax_pos_k"], B, 256, 0,
-                          [P(st.g_logits), P(st.cur), P(st.pos),
-                           I32(V), I32(B)]))
-            st.g_replay = rk.rtc.build_node_graph(nodes)
-            self._gstep_nodes = len(nodes)
-        st.g_replay()
+                rl.append(rk.rtc.build_node_graph(nodes))
+            # tail: final rms -> g_h; logits gemv; argmax+pos
+            tail = [
+                (gf["rms_k"], B, 256, 0,
+                 [P(st.g_x), P(self.fin_w), P(st.g_h),
+                  I32(H), I32(B), F32(EPS)]),
+                (gf["gemv_k"], B * (V // 8), 256, 0,
+                 [P(st.g_h), P(self.lm_w), P(st.g_logits),
+                  I32(H), I32(V), I32(B)]),
+                (gf["argmax_pos_k"], B, 256, 0,
+                 [P(st.g_logits), P(st.cur), P(st.pos),
+                  I32(V), I32(B)]),
+            ]
+            rl.append(rk.rtc.build_node_graph(tail))
+            self._gstep_nodes = len(rl)
+        for rp in st.g_rl:
+            rp()
         self._last_logits = st.g_logits
 
     def _decode_step_rtc(self, st: _State) -> None:
@@ -1342,8 +1348,7 @@ class Engine:
         if self._rtk:
             # mega first: it is the best path when it works and must never
             # be starved by a slow graph-capture attempt ahead of it
-            if getattr(self._rtk, "megafn", None) is not None \
-                    and st.B <= getattr(self._rtk, "nblk", 0):
+            if False:
                 candidates.append(("mega_all",
                                    lambda s=st: self._decode_all(s)))
             if getattr(self._rtk, "rms", None) is not None:
@@ -1877,27 +1882,6 @@ class Engine:
                 self._cl = 1 if int(out2[0].item()) == 1234 else 3
             except Exception:
                 self._cl = 2
-            # stage 3: how many nodes can one graph hold/launch?
-            self._gmax = 0
-            try:
-                rtc = getattr(getattr(self, "_rtk", None), "rtc", None)
-                if rtc is None:
-                    raise RuntimeError("no rtc")
-                out3 = torch.zeros(4, dtype=torch.int32,
-                                   device=st.cur.device)
-                for n in (2, 8, 64, 200, 400):
-                    specs = []
-                    for _ in range(n):
-                        specs.append((fn, 1, 32, 0,
-                                      [ctypes.c_void_p(
-                                          out3.data_ptr())]))
-                    rp = rtc.build_node_graph(specs)
-                    rp()
-                    torch.cuda.synchronize()
-                    if int(out3[0].item()) == 1234:
-                        self._gmax = n
-            except Exception:
-                pass
             return 1
         except Exception:
             return 9
@@ -1945,11 +1929,9 @@ class Engine:
                  | ((getattr(self, "_gn", 0) & 7) << 4)
                  | ((getattr(self, "_leanf_exc", 0) & 3) << 7))
         elif st.B == 4:
-            # 4b decode_name | 3b max-node bucket | 1b gn probe
-            gm = getattr(self, "_gmax", 0)
-            gmc = {0: 0, 2: 1, 8: 2, 64: 3, 200: 4, 400: 5}.get(gm, 6)
+            # 4b decode_name | 3b capture-launch probe | 1b gn probe
             p = ((getattr(st, "decode_name", 0) & 15)
-                 | ((gmc & 7) << 4)
+                 | ((getattr(self, "_cl", 0) & 7) << 4)
                  | ((getattr(self, "_gn", 0) & 1) << 7))
         elif st.B == 16:
             # 2b decode name, 1b mega adopted, 2b mega bench bucket
