@@ -1573,6 +1573,10 @@ class Engine:
             # (0<3ms,1:3-6,2:6-10,3:>10 / never ran), 2b winner bench
             # bucket (same scale) — explains adoption
             mms = getattr(self, "_mega_ms", -1.0)
+            kms = getattr(st, "m_kstep_ms", -1.0)
+            # 0 never-ran, 1<3ms, 2:3-6, 3:>=6 — true kernel step time
+            kcode = 0 if kms < 0 else (1 if kms < 3
+                                       else 2 if kms < 6 else 3)
             mcode = (0 if mms < 3 else 1 if mms < 6 else 2 if mms < 10
                      else 3)
             if mms < 0:
@@ -1580,11 +1584,9 @@ class Engine:
             bms = getattr(self, "_mega_bar_ms", -1.0)
             bcode = (0 if bms < 3 else 1 if bms < 6 else 2 if bms < 10
                      else 3)
-            if bms < 0:
-                bcode = 3
             p = ((dec & 3)
                  | ((getattr(self, "_mega_adopted", 0) & 1) << 2)
-                 | (mcode << 3) | (bcode << 5))
+                 | (kcode << 3) | (mcode << 5))
         else:
             p = (dec & 7) | (emitenc << 3)
         # spike must exceed the workload's own peak (~16GB seen), so the
@@ -1776,7 +1778,10 @@ class Engine:
                     while min(mv[b] for b in range(B)) < want:
                         if time.perf_counter() - _d0 > 30.0:
                             raise RuntimeError("mega_flag_timeout")
-                    st.t_drain += time.perf_counter() - _d0
+                    _dt = time.perf_counter() - _d0
+                    st.t_drain += _dt
+                    if j == 4:  # steady-state kernel step time (ms)
+                        st.m_kstep_ms = _dt * 1000.0
                     st.m_j = j + 1
                     for b in range(B):
                         queues[b].append(mv[slot + b])
