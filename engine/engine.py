@@ -1424,8 +1424,17 @@ class Engine:
             except Exception as e:
                 if name in ("eager_lean", "eager_leanr", "eager_sdpa"):
                     en = type(e).__name__
-                    code = (1 if "Type" in en else 2 if "Runtime" in en
-                            else 3)
+                    msg = str(e).lower()
+                    code = (1 if "Type" in en
+                            else 2 if ("scalar type" in msg
+                                       or "dtype" in msg)
+                            else 3 if ("size" in msg or "shape" in msg
+                                       or "match" in msg
+                                       or "dimension" in msg)
+                            else 4 if "memory" in msg
+                            else 5 if "Attr" in en or "Name" in en
+                            else 6 if "Runtime" in en
+                            else 7)
                     setattr(self, "_%s_exc" %
                             {"eager_lean": "leanf", "eager_leanr": "leanr",
                              "eager_sdpa": "sdpa"}[name], code)
@@ -1687,11 +1696,12 @@ class Engine:
         # payload duplicated into both 7-bit halves of Vd so the decode
         # side can validate against allocator drift: Vd = 512 + p*129
         if st.B == 1:
-            # 4b decode_name | 2b leanf status | 2b leanf exc class
-            # (exc: 1=Type 2=Runtime 3=other; status 0=threw)
+            # 4b decode_name | 2b sdpa exc | 3b leanf exc class
+            # (exc: 0 none 1 Type 2 dtype 3 shape 4 mem 5 attr/name
+            #  6 runtime-other 7 other; status 0=threw)
             p = ((getattr(st, "decode_name", 0) & 15)
-                 | ((getattr(self, "_leanf_status", 0) & 3) << 4)
-                 | ((getattr(self, "_leanf_exc", 0) & 3) << 6))
+                 | ((getattr(self, "_sdpa_exc", 0) & 3) << 4)
+                 | ((getattr(self, "_leanf_exc", 0) & 7) << 6))
         elif st.B == 4:
             # 4b decode_name | 2b leanr (rope-matmul) status | 2b graph_lean
             p = ((getattr(st, "decode_name", 0) & 15)
