@@ -1276,15 +1276,7 @@ class RtcKernels:
             from kernels.megacub import MEGA_CUBIN_B64
             _raw = base64.b64decode(MEGA_CUBIN_B64)
             self.mega_rt = False
-            if self.rtc.rt is not None:
-                try:
-                    self.megafn = self.rtc.load_cubin_rt(
-                        _raw, "step_all_k")
-                    self.mega_rt = True
-                except Exception:
-                    self.megafn = None
-            if self.megafn is None:
-                self.megafn = self.rtc.load_cubin(_raw, "step_all_k")
+            self.megafn = self.rtc.load_cubin(_raw, "step_all_k")
             self.cub_path = True
 
     @property
