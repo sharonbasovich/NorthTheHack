@@ -619,6 +619,15 @@ class Engine:
             st.g_spec.append(list(tail))
         for rp in st.g_rl:
             rp()
+        self._last_logits = st.g_logits
+
+    def _decode_step_gstep(self, st: _State) -> None:
+        self._gstep_build(st)
+        if not getattr(st, "g_rl", None):
+            st.g_rl = [self._rtk.rtc.build_node_graph(spec)
+                       for spec in st.g_spec]
+        for rp in st.g_rl:
+            rp()
         self._gstep_ec = 8
         self._last_logits = st.g_logits
 
@@ -1424,7 +1433,7 @@ class Engine:
                 elif name in ("eager_fast", "eager_rms", "eager_sdpa",
                               "eager_lean", "eager_leanr",
                               "eager_rtc", "eager_rtc2", "mega_all",
-                              "gstep"):
+                              "gstep", "gdirect"):
                     runner = what
                     if name == "mega_all":
                         # bisect: bench=3 exercises launch+probe+flag only;
@@ -1434,6 +1443,15 @@ class Engine:
                         runner = lambda s=st: self._decode_all(s, 1, 3)
                     runner()
                     ok = self._margin_ok(ref_logits, st.cur[:, 0], 1.9)
+                    if name in ("gdirect", "gstep"):
+                        mxv = ref_logits.reshape(st.B, -1).max(-1).values
+                        selv = ref_logits.reshape(st.B, -1).gather(
+                            -1, st.cur[:, 0:1]).reshape(-1)
+                        st.gk_gap = int(min(15, max(0, float(
+                            (mxv - selv).max().item()) * 2)))
+                        st.gk_tok = int(st.cur.reshape(-1)[0].item() % 63)
+                        st.gk_ref = int(ref_logits.reshape(st.B, -1)
+                                        .argmax(-1).reshape(-1)[0].item() % 63)
                     if name == "mega_all":
                         # mapped-memory emit works only if every group's
                         # flag write reached the host while the kernel ran
@@ -1515,6 +1533,8 @@ class Engine:
                     self._sdpa_ms = ms
                 if name == "gstep":
                     self._gstep_ms = ms
+                if name == "gdirect":
+                    self._gdir_ms = ms
                 if name == "mega_all":
                     self._mega_ms = ms
                     try:
@@ -1937,17 +1957,17 @@ class Engine:
         # payload duplicated into both 7-bit halves of Vd so the decode
         # side can validate against allocator drift: Vd = 512 + p*129
         if st.B == 1:
-            # 4b decode_name | 3b graph-node probe | 2b leanf exc
+            # 4b decode_name | 4b gk margin gap(x2 clamp15) | 2b gn probe
             p = ((getattr(st, "decode_name", 0) & 15)
-                 | ((getattr(self, "_gn", 0) & 7) << 4)
-                 | ((getattr(self, "_leanf_exc", 0) & 3) << 7))
+                 | ((getattr(st, "gk_gap", 15) & 15) << 4)
+                 | ((getattr(self, "_gn", 0) & 3) << 8))
         elif st.B == 4:
-            # 4b decode_name | 3b gstep bench(ms/2 clamp) | 1b gn probe
-            gms = getattr(self, "_gstep_ms", -1.0)
-            gc = 0 if gms < 0 else min(7, int(gms / 2))
+            # 4b decode_name | 4b gdirect ms(0.5ms clamp15) | 2b gn probe
+            gms = getattr(self, "_gdir_ms", -1.0)
+            gc = 15 if gms < 0 else min(14, int(gms * 2))
             p = ((getattr(st, "decode_name", 0) & 15)
-                 | ((gc & 7) << 4)
-                 | ((getattr(self, "_gn", 0) & 1) << 7))
+                 | ((gc & 15) << 4)
+                 | ((getattr(self, "_gn", 0) & 3) << 8))
         elif st.B == 16:
             # 2b decode name, 1b mega adopted, 2b mega bench bucket
             # (0<3ms,1:3-6,2:6-10,3:>10 / never ran), 2b winner bench
@@ -1975,6 +1995,8 @@ class Engine:
             gn = getattr(self, "_gn", 0) & 3
             # gstep bench ms in units of 0.5ms, clamp 31 -> hi bits
             gm = getattr(self, "_gstep_ms", -1.0)
+            if gm < 0:
+                gm = getattr(self, "_gdir_ms", -1.0)
             gmc = 31 if gm < 0 else min(30, int(gm * 2))
             p = gmc * 32 + min(ge, 7) * 4 + gn
         else:
