@@ -874,6 +874,22 @@ extern "C" __global__ void step_all_k(
     int nwl = per * (NT / 32);
     int gwl = loc * (NT / 32) + (tid >> 5);
 
+    // co-residency probe: software barriers deadlock if not all group
+    // blocks are resident; bail out cleanly instead of hanging
+    {
+        if (tid == 0) atomicAdd(cnt + B, 1u);
+        __syncthreads();
+        unsigned want = (unsigned)(B * per);
+        long long sp = 0;
+        while (*(volatile unsigned*)(cnt + B) != want) {
+            if (++sp > 40000000LL) {
+                __syncthreads();
+                if (tid == 0) flag[b] = -(long long)(100 + blk);
+                return;
+            }
+        }
+    }
+
     if (bench == 1) {
         for (int s = 0; s < ntok; ++s) {
             for (int i = 0; i < NL * 6 + 4; ++i) gbar(gcnt, ggen);

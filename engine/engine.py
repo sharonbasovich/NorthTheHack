@@ -547,7 +547,7 @@ class Engine:
                                      device=dev)
             st.m_amaxi = torch.empty(rk.nblk * B, dtype=torch.int32,
                                      device=dev)
-            st.m_cnt = torch.zeros(B, dtype=torch.int32, device=dev)
+            st.m_cnt = torch.zeros(B + 1, dtype=torch.int32, device=dev)
             st.m_gen = torch.zeros(B, dtype=torch.int32, device=dev)
             self._mega_stage = 3
             # device-resident flag/token area; host polls via async D2H
@@ -565,6 +565,7 @@ class Engine:
             st.m_pstream = torch.cuda.Stream()
             self._mega_stage = 4
         self._mega_stage = 5
+        st.m_cnt[st.B:].fill_(0)   # reset residency probe slot
         rk.step_all(st.m_lw, self.embed_w, self.fin_w, st.cos, st.sin,
                     st.pos, st.cur, st.m_hid, st.m_hbuf, st.m_qkv,
                     st.m_obuf, st.m_gu, st.m_logits, st.m_amaxv,
@@ -1825,7 +1826,16 @@ class Engine:
                         if min(st.m_hflag.tolist()) >= want:
                             break
                         if time.perf_counter() - _d0 > 30.0:
-                            raise RuntimeError("mega_flag_timeout")
+                            # kernel hung — abandon mega for the rest of
+                            # this generation; cur/pos on device hold the
+                            # last committed step, so the normal runner
+                            # resumes correctly
+                            st.mega_flag = False
+                            st.m_j = getattr(st, "m_j", 0)
+                            self._mega_dead = True
+                            break
+                    if not st.mega_flag:
+                        break
                     # flag ok — fetch this step's token row
                     tp = ctypes.c_void_p(
                         st.m_mapdev + 8 * B + j * B * 8)
