@@ -890,13 +890,13 @@ extern "C" __global__ void step_all_k(
     float* logb = logits + (long long)b * VDIM;
 
     for (int step_i = 0; step_i < ntok; ++step_i) {
-    // embed current token into residual stream
-    if (loc == 0) {
+    // embed: every block reads cur[b] and writes hidb — identical,
+    // no barrier needed before the redundant norm
+    {
         long long tok = cur[b];
         const bf16* e = embed + tok * (long long)HDIM;
         for (int i = tid; i < HDIM; i += NT) hidb[i] = e[i];
     }
-    GB();
 
     for (int l = 0; l < NL; ++l) {
         const bf16* w_ln_in = (const bf16*)lw[l * 10 + 0];
@@ -910,9 +910,8 @@ extern "C" __global__ void step_all_k(
         bf16* kcb           = (bf16*)lw[l * 10 + 8];
         bf16* vcb           = (bf16*)lw[l * 10 + 9];
 
-        if (loc == 0) rms_row(hidb, w_ln_in, h + (long long)b * HDIM,
-                              eps, red);
-        GB();
+        // every block norms redundantly — identical writes, no barrier
+        rms_row(hidb, w_ln_in, h + (long long)b * HDIM, eps, red);
         gemv_g(wqkv, h + (long long)b * HDIM, qkvb, QKVD, HDIM, 0, 0,
                0, gwl, nwl);
         GB();
@@ -925,9 +924,7 @@ extern "C" __global__ void step_all_k(
         GB();
         gemv_g(wo, obufb, hidb, HDIM, ODIM, hidb, 0, 0, gwl, nwl);
         GB();
-        if (loc == 0) rms_row(hidb, w_ln2, h2 + (long long)b * HDIM,
-                              eps, red);
-        GB();
+        rms_row(hidb, w_ln2, h2 + (long long)b * HDIM, eps, red);
         gemv_g(wgu, h2 + (long long)b * HDIM, gub, GDIM, HDIM, 0, 0,
                0, gwl, nwl);
         GB();
@@ -935,9 +932,7 @@ extern "C" __global__ void step_all_k(
         GB();
     }
 
-    if (loc == 0) rms_row(hidb, finw, h + (long long)b * HDIM, eps,
-                          red);
-    GB();
+    rms_row(hidb, finw, h + (long long)b * HDIM, eps, red);
     gemv_gf(embed, h + (long long)b * HDIM, logb, VDIM, HDIM,
             gwl, nwl);
     GB();
@@ -1214,6 +1209,7 @@ class RtcKernels:
         smem = (cap + 8) * 6 + 512
         # thread-block-cluster variant: each batch row gets a cluster of
         # 8 blocks with hardware cluster barriers (per = 8)
+        self.last_variant = 0
         if self.megaclu is not None and B * 8 <= self.nblk:
             try:
                 self.rtc.launch(self.megaclu, B * 8, 1024, smem,
@@ -1226,6 +1222,7 @@ class RtcKernels:
                                  ctypes.c_void_p(tokm_dev),
                                  i32(B), i32(NL), i32(ntok), f32(eps),
                                  i64(cap), i32(bench)], cluster=8)
+                self.last_variant = 1
                 return
             except Exception:
                 self.megaclu = None
@@ -1242,10 +1239,12 @@ class RtcKernels:
                                  i32(B), i32(NL), i32(ntok), f32(eps),
                                  i64(cap), i32(bench)], coop=True)
                 self.coop_ok = True
+                self.last_variant = 2
                 return
             except Exception:
                 self.coop_ok = False
                 self.megacoop = None
+        self.last_variant = 3
         self.rtc.launch(self.megafn, self.nblk, 1024, smem,
                         [ptr(lw), ptr(embed), ptr(finw), ptr(cost),
                          ptr(sint), ptr(pos), ptr(cur), ptr(hid),
