@@ -1038,6 +1038,7 @@ class Rtc:
     def _load(self):
         # libcuda is required (driver is always present); nvrtc is
         # optional — without it we fall back to the embedded cubin.
+        self.rt_fns = set()
         self.cuda = ctypes.CDLL("libcuda.so.1")
         for name in ("cuModuleLoadData", "cuModuleGetFunction",
                      "cuLaunchKernel", "cuMemHostAlloc",
@@ -1088,7 +1089,14 @@ class Rtc:
             pass
 
     def load_cubin(self, data: bytes, fn_name: str):
-        """Load precompiled cubin bytes (no nvrtc needed)."""
+        """Load precompiled cubin bytes — runtime API first."""
+        if self.rt is not None:
+            try:
+                k = self.load_cubin_rt(data, fn_name)
+                self.rt_fns.add(k.value)
+                return k
+            except Exception:
+                pass
         mod = ctypes.c_void_p()
         rc = self.cuda.cuModuleLoadData(ctypes.byref(mod),
                                         ctypes.c_char_p(data))
@@ -1115,6 +1123,11 @@ class Rtc:
         if rc or not kern:
             raise RuntimeError(f"cudaLibraryGetKernel rc={rc}")
         return kern
+
+    def _any(self, fn, grid, block, smem, args):
+        if getattr(fn, "value", fn) in self.rt_fns:
+            return self.launch_rt(fn, grid, block, smem, args)
+        return self.launch(fn, grid, block, smem, args)
 
     def launch_rt(self, kern, grid, block, smem, args):
         """Launch via cudaLaunchKernelExC — same API torch uses."""
@@ -1161,6 +1174,18 @@ class Rtc:
         ptx = ctypes.create_string_buffer(sz.value)
         self.nvrtc.nvrtcGetPTX(prog, ptx)
         self.nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
+        if self.rt is not None:
+            lib = ctypes.c_void_p()
+            rc = self.rt.cudaLibraryLoadData(
+                ctypes.byref(lib), ptx.raw, None, None, 0,
+                None, None, 0)
+            if rc == 0 and lib:
+                kern = ctypes.c_void_p()
+                rc = self.rt.cudaLibraryGetKernel(
+                    ctypes.byref(kern), lib, fn_name.encode())
+                if rc == 0 and kern:
+                    self.rt_fns.add(kern.value)
+                    return kern
         mod = ctypes.c_void_p()
         rc = self.cuda.cuModuleLoadData(ctypes.byref(mod), ptx.raw)
         if rc or not mod:
@@ -1418,56 +1443,36 @@ class RtcKernels:
                         "attn_r_k", "argmax_r_k", "emit_finish_k")
             self.gf_rt = {}
             self.gf_mode = 0   # 1=driver, 2=runtime
-            for attempt in range(8):
+            for attempt in range(6):
                 blob = blobs[attempt % len(blobs)] if blobs else None
                 if blob is None:
                     self.gf_err = 8
                     break
-                # runtime-API load first (torch's own path); driver second
-                if self.rtc.rt is not None and attempt % 2 == 0:
-                    lib = ctypes.c_void_p()
-                    rc = self.rtc.rt.cudaLibraryLoadData(
-                        ctypes.byref(lib), ctypes.c_char_p(blob),
-                        None, None, 0, None, None, 0)
-                    self.gf_err = 40 + (rc & 31) if rc else 8
-                    if rc == 0 and lib:
-                        ok = True
-                        for ni, nm in enumerate(fn_names):
-                            f = ctypes.c_void_p()
-                            rc = self.rtc.rt.cudaLibraryGetKernel(
-                                ctypes.byref(f), lib, nm.encode())
-                            if rc or not f:
-                                self.gf_err = 60 + ni
-                                ok = False
-                                break
-                            self.gf_rt[nm] = f
-                        if ok and len(self.gf_rt) == len(fn_names):
-                            self.gf_err = 0
-                            self.gf_mode = 2
-                            break
-                        if not ok:
-                            break
-                    continue
-                gmod = ctypes.c_void_p()
-                rc = self.rtc.cuda.cuModuleLoadData(
-                    ctypes.byref(gmod), ctypes.c_char_p(blob))
-                self.gf_err = rc if rc else 8
-                if rc == 0 and gmod:
+                if self.rtc.rt is None:
+                    self.gf_err = 9
+                    break
+                lib = ctypes.c_void_p()
+                rc = self.rtc.rt.cudaLibraryLoadData(
+                    ctypes.byref(lib), ctypes.c_char_p(blob),
+                    None, None, 0, None, None, 0)
+                self.gf_err = 40 + (rc & 31) if rc else 8
+                if rc == 0 and lib:
                     ok = True
                     for ni, nm in enumerate(fn_names):
                         f = ctypes.c_void_p()
-                        rc = self.rtc.cuda.cuModuleGetFunction(
-                            ctypes.byref(f), gmod, nm.encode())
+                        rc = self.rtc.rt.cudaLibraryGetKernel(
+                            ctypes.byref(f), lib, nm.encode())
                         if rc or not f:
-                            self.gf_err = 20 + ni
+                            self.gf_err = 60 + ni
                             ok = False
                             break
-                        self.gf[nm] = f
-                    if ok and len(self.gf) == len(fn_names):
+                        self.gf_rt[nm] = f
+                    if ok and len(self.gf_rt) == len(fn_names):
                         self.gf_err = 0
-                        self.gf_mode = 1
+                        self.gf_mode = 2
                         break
-                    self.gf_err = 28 if ok else self.gf_err
+                    if not ok:
+                        break
         except Exception:
             self.gf = {}
             if not getattr(self, "gf_err", 0):
@@ -1478,33 +1483,33 @@ class RtcKernels:
         return self.rtc.ok and self.megafn is not None
 
     def rms_norm(self, x, w, out, n, eps):
-        self.rtc.launch(self.rms, x.shape[0], 256, 0,
+        self.rtc._any(self.rms, x.shape[0], 256, 0,
                         [ptr(x), ptr(w), ptr(out), i32(n), f32(eps)])
 
     def rope_cache(self, qkv, qn, kn, cosb, sinb, qbuf, kc, vc, pos, cap, B):
-        self.rtc.launch(self.rope, B * 48, 128, 0,
+        self.rtc._any(self.rope, B * 48, 128, 0,
                         [ptr(qkv), ptr(qn), ptr(kn), ptr(cosb), ptr(sinb),
                          ptr(qbuf), ptr(kc), ptr(vc), ptr(pos),
                          i64(cap), f32(1e-6)])
 
     def attn(self, qbuf, kc, vc, pos, out, cap, B, maxs):
         smem = (maxs + 8) * 6 + 64
-        self.rtc.launch(self.attn, B * 32, 128, smem,
+        self.rtc._any(self.attn, B * 32, 128, smem,
                         [ptr(qbuf), ptr(kc), ptr(vc), ptr(pos), ptr(out),
                          i64(cap), f32(1.0 / 128 ** 0.5)])
 
     def attn_mega(self, qkv, qn, kn, cosb, sinb, kc, vc, pos, out,
                   cap, B, maxs):
         smem = (maxs + 8) * 6 + 64
-        self.rtc.launch(self.mega, B * 8, 128, smem,
+        self.rtc._any(self.mega, B * 8, 128, smem,
                         [ptr(qkv), ptr(qn), ptr(kn), ptr(cosb), ptr(sinb),
                          ptr(kc), ptr(vc), ptr(pos), ptr(out),
                          i64(cap), f32(1.0 / 128 ** 0.5), f32(1e-6)])
 
     def silu_mul(self, gu, out, I):
         n = gu.shape[0] * I
-        self.rtc.launch(self.silu, (n + 127) // 128, 128, 0,
-                        [ptr(gu), ptr(out), i32(I)])
+        self.rtc._any(self.silu, (n + 127) // 128, 128, 0,
+                      [ptr(gu), ptr(out), i32(I)])
 
     def host_map(self, nbytes):
         """Zero-copy host buffer -> (host ctypes array, device ptr).
@@ -1551,7 +1556,7 @@ class RtcKernels:
         self.last_variant = 0
         if False and self.megaclu is not None and B * 8 <= self.nblk:
             try:
-                self.rtc.launch(self.megaclu, B * 8, 1024, smem,
+                self.rtc._any(self.megaclu, B * 8, 1024, smem,
                                 [ptr(lw), ptr(embed), ptr(finw), ptr(cost),
                                  ptr(sint), ptr(pos), ptr(cur), ptr(hid),
                                  ptr(hbuf), ptr(qkv), ptr(obuf), ptr(gu),
@@ -1565,7 +1570,7 @@ class RtcKernels:
                 return
             except Exception:
                 self.megaclu = None
-        if self.megacoop is not None:
+        if self.megacoop is not None and self.megacoop.value not in self.rtc.rt_fns:
             try:
                 self.rtc.launch(self.megacoop, self.nblk, 1024, smem,
                                 [ptr(lw), ptr(embed), ptr(finw), ptr(cost),
@@ -1601,7 +1606,5 @@ class RtcKernels:
                 self._gn_cache[key] = rep
             rep()
             self.last_variant = 4
-        elif getattr(self, "mega_rt", False):
-            self.rtc.launch_rt(self.megafn, self.nblk, 1024, smem, _args)
         else:
-            self.rtc.launch(self.megafn, self.nblk, 1024, smem, _args)
+            self.rtc._any(self.megafn, self.nblk, 1024, smem, _args)

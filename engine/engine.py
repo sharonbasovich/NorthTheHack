@@ -1459,7 +1459,7 @@ class Engine:
         if self._rtk:
             # mega first: it is the best path when it works and must never
             # be starved by a slow graph-capture attempt ahead of it
-            if False:
+            if getattr(self._rtk, "megafn", None) is not None:
                 candidates.append(("mega_all",
                                    lambda s=st: self._decode_all(s)))
             if getattr(self._rtk, "rms", None) is not None:
@@ -1531,11 +1531,8 @@ class Engine:
                               "gstep", "gdirect"):
                     runner = what
                     if name == "mega_all":
-                        # bisect: bench=3 exercises launch+probe+flag only;
-                        # flag -333 keeps mega_flag false (never adopted)
-                        self._mega_stage = 6
-                        self._decode_all(st, 1, 3)
-                        runner = lambda s=st: self._decode_all(s, 1, 3)
+                        # real single-token run — margin-checkable via cur
+                        runner = lambda s=st: self._decode_all(s, 1, 0)
                     runner()
                     ok = self._margin_ok(ref_logits, st.cur[:, 0], 1.9)
                     if name in ("gdirect", "gstep"):
@@ -1565,7 +1562,6 @@ class Engine:
                         torch.cuda.synchronize()
                         st.mega_flag = bool(
                             min(st.m_flagtok[:st.B].tolist()) > 0)
-                        ok = False   # bench probe — never adopt yet
                     if name == "eager_rtc":
                         self._rtc_status = 1 if ok else 2
                     if name == "eager_sdpa":
