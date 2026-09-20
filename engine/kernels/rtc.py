@@ -368,18 +368,32 @@ extern "C" __device__ void cudaCGSynchronizeGrid(unsigned long long);
 #define ODIM 4096
 #define GDIM 19456
 
-#ifdef COOP
-__device__ __forceinline__ void gbar(unsigned* cnt, volatile unsigned* gen) {
+#if defined(CLU)
+// hardware thread-block-cluster barrier: on-chip, ~1-3us, no atomics.
+// each batch-row group IS one cluster (per <= 8 blocks).
+__device__ __forceinline__ void gbar_impl(unsigned* cnt,
+                                        volatile unsigned* gen,
+                                        unsigned need) {
+    asm volatile("barrier.cluster.arrive.aligned" ::: "memory");
+    asm volatile("barrier.cluster.wait.aligned" ::: "memory");
+}
+#define gbar(c, g) gbar_impl((c), (g), 0)
+#elif defined(COOP)
+__device__ __forceinline__ void gbar_impl(unsigned* cnt,
+                                        volatile unsigned* gen,
+                                        unsigned need) {
     unsigned long long h;
     cudaCGGetIntrinsicHandle(&h);
     cudaCGSynchronizeGrid(h);
 }
+#define gbar(c, g) gbar_impl((c), (g), 0)
 #else
-__device__ __forceinline__ void gbar(unsigned* cnt, volatile unsigned* gen) {
+__device__ __forceinline__ void gbar_sw(unsigned* cnt, volatile unsigned* gen,
+                                        unsigned need) {
     __syncthreads();
     if (threadIdx.x == 0) {
         unsigned g = *gen;
-        if (atomicAdd(cnt, 1u) == gridDim.x - 1) {
+        if (atomicAdd(cnt, 1u) == need) {
             *cnt = 0;
             __threadfence();
             atomicExch((unsigned*)gen, g + 1);
@@ -389,6 +403,8 @@ __device__ __forceinline__ void gbar(unsigned* cnt, volatile unsigned* gen) {
     }
     __syncthreads();
 }
+// group-local count: only this group's `per` blocks touch cnt[b]
+#define gbar(c, g) gbar_sw((c), (g), (unsigned)(per - 1))
 #endif
 
 __device__ __forceinline__ float prod8(const int4 wv, const int4 xv) {
@@ -1046,10 +1062,37 @@ class Rtc:
             raise RuntimeError(f"cuModuleGetFunction rc={rc}")
         return fn
 
-    def launch(self, fn, grid, block, smem, args, coop=False):
+    def launch(self, fn, grid, block, smem, args, coop=False, cluster=0):
         arr = (ctypes.c_void_p * len(args))(
             *[ctypes.addressof(a) for a in args])
         stream = torch.cuda.current_stream().cuda_stream
+        if cluster:
+            # cuLaunchKernelEx with CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION=1
+            class _Cfg(ctypes.Structure):
+                _fields_ = [
+                    ("gridDimX", ctypes.c_uint32),
+                    ("gridDimY", ctypes.c_uint32),
+                    ("gridDimZ", ctypes.c_uint32),
+                    ("blockDimX", ctypes.c_uint32),
+                    ("blockDimY", ctypes.c_uint32),
+                    ("blockDimZ", ctypes.c_uint32),
+                    ("sharedMemBytes", ctypes.c_uint32),
+                    ("hStream", ctypes.c_void_p),
+                    ("attrs", ctypes.c_void_p),
+                    ("numAttrs", ctypes.c_uint32),
+                ]
+            # CUlaunchAttribute { uint id; union { ... clusterDim[3]; char pad[64]; } }
+            attr = ctypes.create_string_buffer(4 + 64)
+            ctypes.memmove(attr, ctypes.byref(ctypes.c_uint(1)), 4)
+            ctypes.memmove(ctypes.byref(attr, 4),
+                           (ctypes.c_uint32 * 3)(cluster, 1, 1), 12)
+            cfg = _Cfg(grid, 1, 1, block, 1, 1, smem,
+                       ctypes.c_void_p(stream),
+                       ctypes.cast(attr, ctypes.c_void_p), 1)
+            rc = self.cuda.cuLaunchKernelEx(ctypes.byref(cfg), fn, arr, None)
+            if rc:
+                raise RuntimeError(f"cuLaunchKernelEx rc={rc}")
+            return
         if coop:
             rc = self.cuda.cuLaunchCooperativeKernel(
                 fn, grid, 1, 1, block, 1, 1, smem,
@@ -1098,6 +1141,13 @@ class RtcKernels:
                                            "step_all_k")
             # cooperative variant: hardware grid.sync() barriers
             self.megacoop = None
+            self.megaclu = None
+            try:
+                self.megaclu = self.rtc.compile(
+                    "#define CLU 1\n" + MEGA_SRC, "stepallu",
+                    "step_all_k")
+            except Exception:
+                self.megaclu = None
             try:
                 self.megacoop = self.rtc.compile(
                     "#define COOP 1\n" + MEGA_SRC, "stepallc",
@@ -1160,6 +1210,23 @@ class RtcKernels:
                  qkv, obuf, gu, logits, amaxv, amaxi, cnt, gen,
                  flag_dev, tokm_dev, B, NL, ntok, eps, cap, bench=0):
         smem = (cap + 8) * 6 + 512
+        # thread-block-cluster variant: each batch row gets a cluster of
+        # 8 blocks with hardware cluster barriers (per = 8)
+        if self.megaclu is not None and B * 8 <= self.nblk:
+            try:
+                self.rtc.launch(self.megaclu, B * 8, 1024, smem,
+                                [ptr(lw), ptr(embed), ptr(finw), ptr(cost),
+                                 ptr(sint), ptr(pos), ptr(cur), ptr(hid),
+                                 ptr(hbuf), ptr(qkv), ptr(obuf), ptr(gu),
+                                 ptr(logits), ptr(amaxv), ptr(amaxi),
+                                 ptr(cnt), ptr(gen),
+                                 ctypes.c_void_p(flag_dev),
+                                 ctypes.c_void_p(tokm_dev),
+                                 i32(B), i32(NL), i32(ntok), f32(eps),
+                                 i64(cap), i32(bench)], cluster=8)
+                return
+            except Exception:
+                self.megaclu = None
         if self.megacoop is not None:
             try:
                 self.rtc.launch(self.megacoop, self.nblk, 1024, smem,
