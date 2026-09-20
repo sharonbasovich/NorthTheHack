@@ -594,13 +594,10 @@ class Engine:
                 nodes.append((gf["rms_k"], B, 256, 0,
                               [P(st.g_x), P(w["ln_post"]), P(st.g_h),
                                I32(H), I32(B), F32(EPS)]))
-                # gu = h2 @ wgu.T
-                nodes.append((gf["gemv_k"], B * (2 * I // 8), 256, 0,
-                              [P(st.g_h), P(w["wgu"]), P(st.g_gu),
-                               I32(H), I32(2 * I), I32(B)]))
-                # m = silu(gu[:I])*gu[I:]
-                nodes.append((gf["silu_k"], (B * I + 255) // 256, 256, 0,
-                              [P(st.g_gu), P(st.g_m), I32(I), I32(B)]))
+                # m = silu(h2@wgu.gate) * (h2@wgu.up) — fused pair gemv
+                nodes.append((gf["gemv_silu_k"], B * (I // 8), 256, 0,
+                              [P(st.g_h), P(w["wgu"]), P(st.g_m),
+                               I32(H), I32(I), I32(B)]))
                 # x += m @ wd.T
                 nodes.append((gf["gemv_add_k"], B * (H // 8), 256, 0,
                               [P(st.g_m), P(w["wd"]), P(st.g_x),
@@ -1503,6 +1500,8 @@ class Engine:
                 restore()
                 if name == "eager_sdpa":
                     self._sdpa_ms = ms
+                if name == "gstep":
+                    self._gstep_ms = ms
                 if name == "mega_all":
                     self._mega_ms = ms
                     try:
@@ -1929,9 +1928,11 @@ class Engine:
                  | ((getattr(self, "_gn", 0) & 7) << 4)
                  | ((getattr(self, "_leanf_exc", 0) & 3) << 7))
         elif st.B == 4:
-            # 4b decode_name | 3b capture-launch probe | 1b gn probe
+            # 4b decode_name | 3b gstep bench(ms/2 clamp) | 1b gn probe
+            gms = getattr(self, "_gstep_ms", -1.0)
+            gc = 0 if gms < 0 else min(7, int(gms / 2))
             p = ((getattr(st, "decode_name", 0) & 15)
-                 | ((getattr(self, "_cl", 0) & 7) << 4)
+                 | ((gc & 7) << 4)
                  | ((getattr(self, "_gn", 0) & 1) << 7))
         elif st.B == 16:
             # 2b decode name, 1b mega adopted, 2b mega bench bucket

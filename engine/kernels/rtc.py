@@ -1405,7 +1405,7 @@ class RtcKernels:
                     base64.b64decode(GSTEP_PTX_B64)))
             if rc == 0 and gmod:
                 for nm in ("embed_k", "rms_k", "gemv_k", "gemv_add_k",
-                           "rope_kv_k", "attn_k", "silu_k",
+                           "gemv_silu_k", "rope_kv_k", "attn_k",
                            "argmax_pos_k"):
                     f = ctypes.c_void_p()
                     rc = self.rtc.cuda.cuModuleGetFunction(
