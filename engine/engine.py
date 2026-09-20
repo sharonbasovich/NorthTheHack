@@ -1317,15 +1317,7 @@ class Engine:
                         # bisect: bench=3 exercises launch+probe+flag only;
                         # flag -333 keeps mega_flag false (never adopted)
                         self._mega_stage = 6
-                        try:
-                            self._decode_all(st, 1, 3)
-                            self._mgn_stage = 4
-                        except Exception as _e:
-                            self._mgn_stage = {
-                                True: 5}.get("cuGraphLaunch" in str(_e),
-                                             6 if "Instantiate" in str(_e)
-                                             else 7 if "AddKernelNode"
-                                             in str(_e) else 8)
+                        self._decode_all(st, 1, 3)
                         runner = lambda s=st: self._decode_all(s, 1, 3)
                     runner()
                     ok = self._margin_ok(ref_logits, st.cur[:, 0], 1.9)
@@ -1859,11 +1851,8 @@ class Engine:
             var = getattr(self._rtk, "last_variant", 0)
             # 4b decode_name | 3b mega-node probe | 1b gn probe
             mpf = getattr(self, "_mega_probe_flag", None)
-            if mpf is None:
-                mpc = getattr(self, "_mgn_stage", 0)  # 4=ok 5,6,7,8=fail
-            else:
-                mpc = (0 if mpf is None else 1 if mpf == -333
-                       else 2 if mpf == 0 else 3)
+            mpc = (0 if mpf is None else 1 if mpf == -333
+                   else 2 if mpf == 0 else 3)
             p = ((getattr(st, "decode_name", 0) & 15)
                  | ((mpc & 7) << 4)
                  | ((getattr(self, "_gn", 0) & 1) << 7))
