@@ -1287,6 +1287,7 @@ class Engine:
         for b in range(B):
             draft = hists[b].draft(K) or [queues[b][-1]]
             rows.append([queues[b][-1]] + draft + [0] * (K - len(draft)))
+        st._pos_pre_spec = st.pos.clone()
         st.inp_pin.copy_(torch.tensor(rows, dtype=torch.int64))
         st.inp.copy_(st.inp_pin, non_blocking=True)
         st.spec_runner()
@@ -1294,6 +1295,14 @@ class Engine:
         st.emit_pin.copy_(st.emit_dev, non_blocking=True)
         self._drain(st.emit_pin)
         ep = st.emit_pin.tolist()
+        # sanity: a silently-failed verify pass must not emit garbage ids
+        for b in range(B):
+            m_b = ep[b][R]
+            if not (1 <= m_b <= R):
+                raise RuntimeError("bad emit m")
+            for j in range(m_b):
+                if not (0 <= ep[b][j] < V):
+                    raise RuntimeError("bad emit tok")
         tot = 0
         lasts = []
         for b in range(B):
@@ -2285,8 +2294,7 @@ class Engine:
                         # the per-row emit counts on device), disable spec
                         # permanently, and fall through to normal decode
                         try:
-                            st.pos.sub_(
-                                st.emit_dev[:, R].clamp_(0, R))
+                            st.pos.copy_(st._pos_pre_spec)
                         except Exception:
                             pass
                         st.spec_enabled = False
