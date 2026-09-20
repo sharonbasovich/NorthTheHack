@@ -1765,18 +1765,14 @@ class Engine:
                 # keep err=5: batch logits diverged from the slow step on
                 # real tokens — visible in the telemetry nibble
             else:
-                st.spec_runner = lambda: self._decode_step_slow_batch(st)
-                st.spec_ms = self._bench(st.spec_runner)
+                # still correct, but eager verify is never fast enough to
+                # pay for itself — leave spec disabled and let gver win it
                 self._batch_err = 3
-                st.spec_name = 1
-                restore()
-                self._batch_err = 0
         except Exception as exc:
             self._batch_exc = type(exc).__name__[:10]
             restore()
         if ref_logits_b is not None:
-            for make in ("gver", "ext", "jit", "graphb", "graph", "eager",
-                          "rms"):
+            for make in ("gver",):
                 if over_budget():
                     break
                 try:
@@ -1829,9 +1825,8 @@ class Engine:
                     st.inp.fill_(0)
                     st.inp[:, 0] = c0[:, 0]
                     runner()
-                    ok = self._margin_ok(
-                        ref_logits_b, st.emit_dev[:, :R], 1.9
-                    )
+                    ok = bool((st.emit_dev[:, :R]
+                               == ref_logits_b.argmax(-1)).all().item())
                     restore()
                     if ok:
                         ms = self._bench(runner)
@@ -2105,8 +2100,9 @@ class Engine:
             # 4b decode_name | 3b mega-node probe | 1b gn probe
             # status channel: ec*64 | ge*4 | gn  (gf_err is on _rtk)
             ge = getattr(getattr(self, "_rtk", None), "gf_err", 30)
+            gm_ = getattr(getattr(self, "_rtk", None), "gf_mode", 0) & 3
             gn = getattr(self, "_gn", 0) & 7
-            p = min(int(ge), 127) * 8 + gn
+            p = min(int(ge), 31) * 32 + gm_ * 8 + gn
         else:
             # hidden shapes: 4b decode name | 2b leanf | 2b glean
             p = ((dec & 15)

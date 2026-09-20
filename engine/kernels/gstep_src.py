@@ -231,6 +231,10 @@ extern "C" __global__ void attn_k(const bf16* __restrict__ qe,
             acc += __shfl_xor_sync(0xffffffffu, acc, off);
         if (acc * scale > mx) mx = acc * scale;
     }
+    for (int off = 16; off; off >>= 1) {
+        float om = __shfl_xor_sync(0xffffffffu, mx, off);
+        if (om > mx) mx = om;
+    }
     float den = 0.f;
     float oacc[4];
     for (int i = 0; i < 4; ++i) oacc[i] = 0.f;
@@ -346,6 +350,10 @@ extern "C" __global__ void attn_r_k(const bf16* __restrict__ qe,
         for (int off = 16; off; off >>= 1)
             acc += __shfl_xor_sync(0xffffffffu, acc, off);
         if (acc * scale > mx) mx = acc * scale;
+    }
+    for (int off = 16; off; off >>= 1) {
+        float om = __shfl_xor_sync(0xffffffffu, mx, off);
+        if (om > mx) mx = om;
     }
     float den = 0.f;
     float oacc[4];
