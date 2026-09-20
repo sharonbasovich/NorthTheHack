@@ -1544,6 +1544,22 @@ class Engine:
                         runner = lambda s=st: self._decode_all(s, 1, 0)
                     runner()
                     ok = self._margin_ok(ref_logits, st.cur[:, 0], 1.9)
+                    if ok and name in ("gstep", "gdirect", "mega_all"):
+                        # multi-step: margin must hold for 3 consecutive
+                        # tokens — reference replays the candidate's own
+                        # committed state each step
+                        for _rep in range(2):
+                            c_s = st.cur.clone()
+                            p_s = st.pos.clone()
+                            self._decode_step_slow(st)
+                            rlg = self._last_logits.clone()
+                            st.cur.copy_(c_s)
+                            st.pos.copy_(p_s)
+                            runner()
+                            ok = self._margin_ok(
+                                rlg, st.cur[:, 0], 1.9)
+                            if not ok:
+                                break
                     if name in ("gdirect", "gstep"):
                         mxv = ref_logits.reshape(st.B, -1).max(-1).values
                         selv = ref_logits.reshape(st.B, -1).gather(
