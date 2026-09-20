@@ -526,11 +526,12 @@ class Engine:
 
 
     def _decode_step_gstep(self, st: _State) -> None:
-        """Whole decode step as ONE driver graph of custom kernel nodes —
-        ~330 sequential nodes, zero host dispatch per token."""
+        """Whole decode step as per-layer driver graphs of custom kernel
+        nodes — ~38 sequential graph launches, zero host dispatch."""
         rk = self._rtk
         B = st.B
-        if getattr(st, "g_replay", None) is None:
+        if getattr(st, "g_rl", None) is None:
+            self._gstep_ec = 1
             dev = self.dev
             bf = torch.bfloat16
             st.g_x = torch.zeros(B, H, dtype=bf, device=dev)
@@ -563,6 +564,7 @@ class Engine:
                           [P(self.embed_w), P(st.cur), P(st.g_x),
                            I32(H), I32(B)]))
             rl.append(rk.rtc.build_node_graph(nodes))
+            self._gstep_ec = 2
             for i, w in enumerate(self.layers):
                 nodes = []
                 # h = rms(x)
@@ -603,6 +605,7 @@ class Engine:
                               [P(st.g_m), P(w["wd"]), P(st.g_x),
                                I32(I), I32(H), I32(B)]))
                 rl.append(rk.rtc.build_node_graph(nodes))
+                self._gstep_ec = min(6, 3 + (i >> 4))
             # tail: final rms -> g_h; logits gemv; argmax+pos
             tail = [
                 (gf["rms_k"], B, 256, 0,
@@ -617,8 +620,10 @@ class Engine:
             ]
             rl.append(rk.rtc.build_node_graph(tail))
             self._gstep_nodes = len(rl)
+            self._gstep_ec = 7
         for rp in st.g_rl:
             rp()
+        self._gstep_ec = 8
         self._last_logits = st.g_logits
 
     def _decode_step_rtc(self, st: _State) -> None:
