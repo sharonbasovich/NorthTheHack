@@ -1544,6 +1544,7 @@ class Engine:
                         runner = lambda s=st: self._decode_all(s, 1, 0)
                     runner()
                     ok = self._margin_ok(ref_logits, st.cur[:, 0], 1.9)
+                    _rlg_tel = ref_logits
                     if ok and name in ("gstep", "gdirect", "mega_all"):
                         # multi-step: margin must hold for 3 consecutive
                         # tokens — reference replays the candidate's own
@@ -1553,6 +1554,7 @@ class Engine:
                             p_s = st.pos.clone()
                             self._decode_step_slow(st)
                             rlg = self._last_logits.clone()
+                            _rlg_tel = rlg
                             st.cur.copy_(c_s)
                             st.pos.copy_(p_s)
                             runner()
@@ -1561,15 +1563,15 @@ class Engine:
                             if not ok:
                                 break
                     if name in ("gdirect", "gstep"):
-                        mxv = ref_logits.reshape(st.B, -1).max(-1).values
-                        selv = ref_logits.reshape(st.B, -1).gather(
+                        mxv = _rlg_tel.reshape(st.B, -1).max(-1).values
+                        selv = _rlg_tel.reshape(st.B, -1).gather(
                             -1, st.cur[:, 0:1]).reshape(-1)
                         st.gk_gap = int(min(14, max(0, float(
                             (mxv - selv).max().item()) * 2)))
                         # logits-space diff: how far off are the raw values?
                         try:
                             lg = st.g_logits.reshape(st.B, -1).float()
-                            rf = ref_logits.reshape(st.B, -1).float()
+                            rf = _rlg_tel.reshape(st.B, -1).float()
                             st.gk_ld = int(min(14, max(0, float(
                                 (lg - rf).abs().max().item()) * 2)))
                             # my argmax vs ref argmax same token?
@@ -1578,8 +1580,11 @@ class Engine:
                                           .mean().item() * 3)
                         except Exception:
                             st.gk_ld = 14; st.gk_am = 0
+                        if not ok:
+                            st.gk_gap = 14   # will be overwritten by probe
+                            st.gk_stage = self._gstage_probe(st)
                         st.gk_tok = int(st.cur.reshape(-1)[0].item() % 63)
-                        st.gk_ref = int(ref_logits.reshape(st.B, -1)
+                        st.gk_ref = int(_rlg_tel.reshape(st.B, -1)
                                         .argmax(-1).reshape(-1)[0].item() % 63)
                     if name == "mega_all":
                         # mapped-memory emit works only if every group's
@@ -2049,6 +2054,80 @@ class Engine:
         except Exception:
             return 9
 
+    def _gstage_probe(self, st):
+        """After a failed gdirect margin: replay the kernel plan one stage at
+        a time and diff each intermediate against the torch reference.
+        Returns first-divergent stage code: 1 embed, 2 rms, 3 qkv gemv,
+        4 rope/kv, 5 attn, 6 wo resid, 7 rms2, 8 silu gemv, 9 wd resid,
+        10 final rms, 11 logits gemv; 0 = none diverged."""
+        B = st.B
+        try:
+            self._decode_step_gdirect(st)   # populate g_* buffers
+            torch.cuda.synchronize()
+            x = F.embedding(st.cur, self.embed_w).view(B, H)
+            if (st.g_x.float() - x.float()).abs().max().item() > 0.5:
+                return 1
+            nvalid = st.srange[None, :] > st.pos[:, None]
+            cos = st.cos.index_select(0, st.pos).view(B, 1, 1, D)
+            sin = st.sin.index_select(0, st.pos).view(B, 1, 1, D)
+            for i, w in enumerate(self.layers):
+                h = _rms(x, w["ln_in"]).view(B, H)
+                if (st.g_h.float() - h.float()).abs().max().item() > 0.5:
+                    return 2
+                qkv = h @ w["wqkv"].t()
+                if (st.g_qkv.float() - qkv.float()).abs().max().item() > 1.0:
+                    return 3
+                qk = qkv[:, : (NQ + NKV) * D].view(B, NQ + NKV, D)
+                v = qkv[:, (NQ + NKV) * D :].view(B, NKV, D)
+                qkn = _rms(qk.view(B, NQ + NKV, D), w["qkn"])
+                qke = qkn * cos.view(B, 1, D) + _rot_half(qkn) * sin.view(B, 1, D)
+                qe = qke[:, :NQ]
+                ke = qke[:, NQ:]
+                if (st.g_qe.float() - qe.reshape(B, -1).float()).abs().max().item() > 0.5:
+                    return 4
+                p_ = st.pos.view(B, 1, 1)
+                kpos = st.kc[i].view(B, NKV, st.S, D)
+                # kv write check: compare position pos[b] slice
+                kb = kpos.gather(2, st.pos.view(B,1,1,1).expand(B,NKV,1,D)).squeeze(2)
+                if (kb.float() - ke.float()).abs().max().item() > 0.5:
+                    return 4
+                vpos = st.vc[i].view(B, NKV, st.S, D)
+                vb = vpos.gather(2, st.pos.view(B,1,1,1).expand(B,NKV,1,D)).squeeze(2)
+                if (vb.float() - v.float()).abs().max().item() > 0.5:
+                    return 4
+                qg = qe.reshape(B, NKV, GROUP, D)
+                scores = torch.matmul(qg, st.kc[i].transpose(-1, -2)) * SCALE
+                scores.masked_fill_(nvalid[:, None, None, :], NEG_INF)
+                pp = torch.softmax(scores.float(), dim=-1).to(torch.bfloat16)
+                o = torch.matmul(pp, st.vc[i]).view(B, NQ * D)
+                if (st.g_o.float() - o.float()).abs().max().item() > 0.5:
+                    return 5
+                x = torch.addmm(x, o, w["wo"].t()).view(B, H)
+                if (st.g_x.float() - x.float()).abs().max().item() > 0.5:
+                    return 6
+                h2 = _rms(x, w["ln_post"]).view(B, H)
+                if (st.g_h.float() - h2.float()).abs().max().item() > 0.5:
+                    return 7
+                gu = h2 @ w["wgu"].t()
+                mm = F.silu(gu[:, :I]) * gu[:, I:]
+                if (st.g_m.float() - mm.float()).abs().max().item() > 0.5:
+                    return 8
+                x = torch.addmm(x, mm, w["wd"].t()).view(B, H)
+                if (st.g_x.float() - x.float()).abs().max().item() > 0.5:
+                    return 9
+            h = _rms(x, self.fin_w).view(B, H)
+            if (st.g_h.float() - h.float()).abs().max().item() > 0.5:
+                return 10
+            lg = h @ self.lm_w.t()
+            if (st.g_logits.float() - lg.float()).abs().max().item() > 1.0:
+                return 11
+            return 0
+        except Exception as e:
+            self._gstage_exc = type(e).__name__[:12]
+            return 15
+        finally:
+            pass
+
     def _pack_diag(self, st):
         # telemetry: hidden-case stdout is muted, but each public workload
         # reports peakMemoryBytes. Sample-0 allocates V * 8MB transiently,
@@ -2090,9 +2169,13 @@ class Engine:
             # 4b decode_name | 4b gk margin gap(x2 clamp15) | 2b gn probe
             _g = getattr(st, "gk_gap", -1)
             _g = 15 if _g < 0 else min(14, _g)
+            _sg = getattr(st, "gk_stage", 0) & 15
+            # when margin failed, top byte carries the divergent stage
+            # (stage in 1..15); when it passed, argmax-match fraction
             p = ((getattr(st, "decode_name", 0) & 15)
                  | (_g << 4)
-                 | ((getattr(st, "gk_am", 0) & 3) << 8))
+                 | ((_sg if _g == 14 else
+                     (getattr(st, "gk_am", 0) & 15)) << 8))
         elif st.B == 4:
             # 4b decode_name | 4b gdirect ms(0.5ms clamp15) | 2b gn probe
             _l = getattr(st, "gk_ld", -1)
