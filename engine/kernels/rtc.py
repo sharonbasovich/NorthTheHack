@@ -1210,7 +1210,7 @@ class RtcKernels:
         # thread-block-cluster variant: each batch row gets a cluster of
         # 8 blocks with hardware cluster barriers (per = 8)
         self.last_variant = 0
-        if self.megaclu is not None and B * 8 <= self.nblk:
+        if False and self.megaclu is not None and B * 8 <= self.nblk:
             try:
                 self.rtc.launch(self.megaclu, B * 8, 1024, smem,
                                 [ptr(lw), ptr(embed), ptr(finw), ptr(cost),
