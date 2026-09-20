@@ -1358,21 +1358,37 @@ class Engine:
                                    lambda s=st: self._decode_step_rtc2(s)))
                 candidates.append(("eager_rtc",
                                    lambda s=st: self._decode_step_rtc(s)))
+        # try the graph capture even when the probe failed — probes have
+        # been flaky under gVisor and a real capture attempt fails fast.
+        candidates.append(("graph_slow", self._decode_step_slow))
+        if _HAS_TRITON and not self._step_slow_only:
+            candidates.append(("graph_fast", self._decode_step_fast))
+        candidates.append(("eager_sdpa",
+                           lambda s=st: self._decode_step_sdpa(s)))
+        # lean steps: rope via one matmul per layer; _leanr keeps the
+        # manual _rms to isolate whether F.rms_norm is margin-safe
+        candidates.append(("eager_leanr",
+                           lambda s=st: self._decode_step_lean(s, False)))
         candidates.append(("eager_lean",
                            lambda s=st: self._decode_step_lean(s, True)))
-        self._gn = 9  # BISECT: skip graph-node probe entirely
-        if False:
-            # flaky-under-gvisor: cache verdict across workload processes
-            try:
-                with open("/tmp/devin_gn_verdict") as fh:
-                    self._gn = int(fh.read().strip())
-            except Exception:
-                self._gn = self._graphnode_probe(st)
-                try:
-                    with open("/tmp/devin_gn_verdict", "w") as fh:
-                        fh.write(str(self._gn))
-                except Exception:
-                    pass
+        if self._rtk and getattr(self._rtk, "gf", None):
+            candidates.append(("gstep",
+                               lambda s=st: self._decode_step_gstep(s)))
+        if self._probe("graph"):
+            candidates.append(("graph_lean", self._decode_step_lean))
+        if self._probe("toolchain"):
+            candidates.append(("ext", "ext"))
+        if _HAS_TRITON and not self._step_slow_only:
+            candidates.append(("eager_fast", lambda s=st: self._decode_step_fast(s)))
+        if _HAS_TRITON:
+            candidates.append(("eager_rms", lambda s=st: self._decode_step_rms(s)))
+        # jit only as a fallback: tracing ~1300 ops costs ~10-60s per call,
+        # so skip it entirely when the C++ ext loaded (it strictly dominates).
+        if self._ext is None and self._probe("jit"):
+            candidates.append(("jit", "jit"))
+        self._gn = getattr(self, "_gn", None)
+        if self._gn is None:
+            self._gn = self._graphnode_probe(st)
         if self._rtk and self._gn == 1:
             self._rtk.gn_ok = True
         self._cand_mask = 0
@@ -1943,12 +1959,21 @@ class Engine:
             ccode = (0 if cms < 3 else 1 if cms < 6 else 2 if cms < 10
                      else 3)
             var = getattr(self._rtk, "last_variant", 0)
-            # 4b decode | 4b gstep stage | 4b gf_err | 2b gn
-            ge = getattr(getattr(self._rtk, "rtc", None), "gf_err", 30)
+            # 4b decode_name | 3b mega-node probe | 1b gn probe
+            mpf = getattr(self, "_mega_probe_flag", None)
+            gne, gnrc = getattr(getattr(self._rtk, "rtc", None),
+                                "gn_err", (0, 0))
+            if gne:
+                mpc = min(15, gne)          # stage 1-4 in low nibble
+                mrc = min(15, gnrc)         # rc low nibble in high bits
+            else:
+                mpc = (0 if mpf is None else 1 if mpf == -333 else 2)
+                mrc = min(15, gnrc)
+            # 4b decode | 4b gn stage | 6b gn rc (14 bits max)
             p = ((getattr(st, "decode_name", 0) & 15)
-                 | ((min(15, getattr(self, "_gstep_ec", 0)) & 15) << 4)
-                 | ((ge & 15) << 8)
-                 | ((getattr(self, "_gn", 0) & 3) << 12))
+                 | ((mpc & 15) << 4)
+                 | ((mrc & 15) << 8)
+                 | (((gnrc >> 4) & 3) << 12))
         else:
             # hidden shapes: 4b decode name | 2b leanf | 2b glean
             p = ((dec & 15)
@@ -2081,18 +2106,11 @@ class Engine:
         v = self._pack_diag(st) if st.diag_i == 0 else 0
         if v:
             # one transient V*8MB spike — sets this workload's peak memory
-            # to a value we can decode exactly. If the alloc fails
-            # (fragmentation), shrink until it fits rather than dying.
-            vv = v
-            while vv > 64:
-                try:
-                    buf = torch.empty(vv * 2 * 1024 * 1024,
-                                      dtype=torch.uint8, device=self.dev)
-                    buf.fill_(0)
-                    del buf
-                    break
-                except Exception:
-                    vv >>= 1
+            # to a value we can decode exactly
+            buf = torch.empty(v * 2 * 1024 * 1024, dtype=torch.uint8,
+                              device=self.dev)
+            buf.fill_(0)
+            del buf
         st.diag_i = getattr(st, "diag_i", 0) + 1
         i = 0
         while i < max_new_tokens:

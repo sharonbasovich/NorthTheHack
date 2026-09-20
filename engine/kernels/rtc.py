@@ -1356,7 +1356,6 @@ class RtcKernels:
         self.gn_ok = False
         self._gn_cache = {}
         self.gn_err = (0, 0)
-        self.gf_err = 30
         self.megacoop = None
         self.megaclu = None
         self.nblk = torch.cuda.get_device_properties(
@@ -1388,8 +1387,35 @@ class RtcKernels:
         else:
             # no nvrtc on this box — load the precompiled sm_90 cubin.
             # prefer the runtime API (same launch path torch uses);
-            self.cub_path = False
-        self.gf = {}  # BISECT: module loads disabled
+            # fall back to the driver API.
+            import base64
+            from kernels.megacub import MEGA_CUBIN_B64
+            _raw = base64.b64decode(MEGA_CUBIN_B64)
+            self.mega_rt = False
+            self.megafn = self.rtc.load_cubin(_raw, "step_all_k")
+            self.cub_path = True
+        # fused-step kernels: embedded PTX loaded via cuModuleLoadData
+        self.gf = {}
+        try:
+            import base64
+            from kernels.gstepcub import GSTEP_PTX_B64
+            gmod = ctypes.c_void_p()
+            rc = self.rtc.cuda.cuModuleLoadData(
+                ctypes.byref(gmod), ctypes.c_char_p(
+                    base64.b64decode(GSTEP_PTX_B64)))
+            if rc == 0 and gmod:
+                for nm in ("embed_k", "rms_k", "gemv_k", "gemv_add_k",
+                           "gemv_silu_k", "rope_kv_k", "attn_k",
+                           "argmax_pos_k"):
+                    f = ctypes.c_void_p()
+                    rc = self.rtc.cuda.cuModuleGetFunction(
+                        ctypes.byref(f), gmod, nm.encode())
+                    if rc or not f:
+                        raise RuntimeError(f"missing {nm} rc={rc}")
+                    self.gf[nm] = f
+        except Exception as _e:
+            self.gf = {}
+
     @property
     def ok(self):
         return self.rtc.ok and self.megafn is not None
