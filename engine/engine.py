@@ -453,6 +453,62 @@ class Engine:
         st.cur.copy_(tok.view(B, 1))
         st.pos.add_(1)
 
+    def _rope_matrix(self, st: _State) -> torch.Tensor:
+        """[S, D, D] bf16 per-position rotation: qke = qkn @ M[pos] equals
+        x*cos + rot(x)*sin with one matmul instead of a mul/cat/mul/add
+        chain (~4 fewer kernel launches per layer)."""
+        if getattr(self, "_ropeM_S", None) != st.S:
+            h = D // 2
+            P = torch.zeros(D, D, dtype=torch.bfloat16, device=self.dev)
+            ar = torch.arange(h, device=self.dev)
+            P[ar, ar + h] = -1.0
+            P[ar + h, ar] = 1.0
+            self._ropeM = (
+                torch.diag_embed(st.cos)
+                + P.t().unsqueeze(0) * st.sin[:, None, :]).contiguous()
+            self._ropeM_S = st.S
+        return self._ropeM
+
+    def _decode_step_lean(self, st: _State, rms_fast: bool = True) -> None:
+        """_decode_step_slow with the rope chain collapsed to one matmul
+        and (optionally) F.rms_norm — fewer kernel launches per layer.
+        Margin-gated identically to every other candidate."""
+        B = st.B
+        rms = (lambda x, w: F.rms_norm(x, (x.shape[-1],), w, EPS)
+               if rms_fast else _rms)
+        x = F.embedding(st.cur, self.embed_w)
+        Mb = self._rope_matrix(st).index_select(0, st.pos).unsqueeze(1)
+        nvalid = st.srange[None, :] > st.pos[:, None]
+        _fl = st.kw1 + st.pos.view(B, 1).expand(B, NKV).reshape(-1)
+        for i, w in enumerate(self.layers):
+            h = rms(x.view(B, H), w["ln_in"]).view(B, H)
+            qkv = h @ w["wqkv"].t()
+            qk = qkv[:, : (NQ + NKV) * D].view(B, 1, NQ + NKV, D)
+            v = qkv[:, NQ * D + NKV * D :].view(B, 1, NKV, D)
+            qkn = rms(qk, w["qkn"])
+            qke = torch.matmul(qkn, Mb)
+            qe = qke[:, :, :NQ]
+            ke = qke[:, :, NQ:]
+            st.kc[i].view(-1, D).index_copy_(0, _fl, ke.reshape(-1, D))
+            st.vc[i].view(-1, D).index_copy_(0, _fl, v.reshape(-1, D))
+            qg = qe.reshape(B, NKV, GROUP, D)
+            scores = torch.matmul(qg, st.kc[i].transpose(-1, -2)) * SCALE
+            scores.masked_fill_(nvalid[:, None, None, :], NEG_INF)
+            p = torch.softmax(scores.float(), dim=-1).to(torch.bfloat16)
+            o = torch.matmul(p, st.vc[i]).view(B, NQ * D)
+            xf = x.view(B, H)
+            x = torch.addmm(xf, o, w["wo"].t()).view(B, 1, H)
+            h2 = rms(x.view(B, H), w["ln_post"]).view(B, H)
+            gu = h2 @ w["wgu"].t()
+            m = F.silu(gu[:, :I]) * gu[:, I:]
+            x = torch.addmm(x.view(B, H), m, w["wd"].t()).view(B, 1, H)
+        x = _rms(x, self.fin_w)
+        logits = x.view(B, H) @ self.lm_w.t()
+        self._last_logits = logits
+        tok = logits.argmax(dim=-1)
+        st.cur.copy_(tok.view(B, 1))
+        st.pos.add_(1)
+
     def _decode_step_rtc(self, st: _State) -> None:
         """Decode step on NVRTC-compiled fused kernels: ~9 CUDA launches
         per layer instead of ~30. Numerics replicated exactly (see
@@ -1192,6 +1248,14 @@ class Engine:
             candidates.append(("graph_fast", self._decode_step_fast))
         candidates.append(("eager_sdpa",
                            lambda s=st: self._decode_step_sdpa(s)))
+        # lean steps: rope via one matmul per layer; _leanr keeps the
+        # manual _rms to isolate whether F.rms_norm is margin-safe
+        candidates.append(("eager_leanr",
+                           lambda s=st: self._decode_step_lean(s, False)))
+        candidates.append(("eager_lean",
+                           lambda s=st: self._decode_step_lean(s, True)))
+        if self._probe("graph"):
+            candidates.append(("graph_lean", self._decode_step_lean))
         if self._probe("toolchain"):
             candidates.append(("ext", "ext"))
         if _HAS_TRITON and not self._step_slow_only:
@@ -1212,7 +1276,9 @@ class Engine:
                 "graph_slow": 0, "graph_fast": 1, "ext": 2,
                 "eager_fast": 3, "eager_rms": 4, "jit": 5,
                 "compile": 6, "mega_all": 7, "eager_rtc": 8,
-                "eager_rtc2": 9, "eager_sdpa": 10}.get(name, 11)
+                "eager_rtc2": 9, "eager_sdpa": 10,
+                "eager_leanr": 12, "eager_lean": 13,
+                "graph_lean": 14}.get(name, 11)
             try:
                 if name == "ext":
                     mod = self._load_ext(st)
@@ -1223,6 +1289,7 @@ class Engine:
                     restore()
                     runner = mod.step
                 elif name in ("eager_fast", "eager_rms", "eager_sdpa",
+                              "eager_lean", "eager_leanr",
                               "eager_rtc", "eager_rtc2", "mega_all"):
                     runner = what
                     if name == "mega_all":
@@ -1298,7 +1365,9 @@ class Engine:
                     "graph_slow": 0, "graph_fast": 1, "ext": 2,
                     "eager_fast": 3, "eager_rms": 4, "jit": 5,
                     "compile": 6, "mega_all": 7, "eager_rtc": 8,
-                    "eager_rtc2": 9, "eager_sdpa": 10}.get(name, 11)
+                    "eager_rtc2": 9, "eager_sdpa": 10,
+                    "eager_leanr": 12, "eager_lean": 13,
+                    "graph_lean": 14}.get(name, 11)
                 ms = self._bench(runner)
                 restore()
                 if name == "eager_sdpa":
@@ -1329,7 +1398,8 @@ class Engine:
                         "eager_fast": 1, "graph_slow": 2, "graph_fast": 3,
                         "jit": 4, "compile": 5, "ext": 6, "eager_rms": 7,
                         "eager_sdpa": 5, "eager_rtc": 3, "eager_rtc2": 4,
-                        "mega_all": 8,
+                        "mega_all": 8, "eager_leanr": 9, "eager_lean": 10,
+                        "graph_lean": 11,
                     }[name]
                     if name == "mega_all":
                         self._mega_adopted = 1
