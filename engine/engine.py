@@ -644,9 +644,12 @@ class Engine:
         no graph machinery at all."""
         if getattr(st, "g_spec", None) is None:
             self._gstep_build(st)        # buffers + spec only, no graphs
+        _l = (self._rtk.rtc.launch_rt
+              if getattr(self._rtk, "gf_mode", 0) == 2
+              else self._rtk.rtc.launch)
         for spec in st.g_spec:
             for (fn, grid, block, smem, args) in spec:
-                self._rtk.rtc.launch(fn, grid, block, smem, args)
+                _l(fn, grid, block, smem, args)
         self._last_logits = st.g_logits
 
     def _gverify_build(self, st) -> None:
@@ -670,7 +673,7 @@ class Engine:
         def P(t): return ctypes.c_void_p(t.data_ptr())
         def I32(v): return ctypes.c_int(int(v))
         def F32(v): return ctypes.c_float(float(v))
-        gf = rk.gf
+        gf = rk.gf_rt if getattr(rk, "gf_mode", 0) == 2 else rk.gf
         spec = []
         spec.append([(gf["embed_r_k"], (BR * H + 255) // 256, 256, 0,
                       [P(self.embed_w), P(st.inp), P(st.gv_x),
@@ -724,9 +727,12 @@ class Engine:
 
     def _decode_step_gverify(self, st: _State) -> None:
         self._gverify_build(st)
+        _l = (self._rtk.rtc.launch_rt
+              if getattr(self._rtk, "gf_mode", 0) == 2
+              else self._rtk.rtc.launch)
         for spec in st.gv_spec:
             for (fn, grid, block, smem, args) in spec:
-                self._rtk.rtc.launch(fn, grid, block, smem, args)
+                _l(fn, grid, block, smem, args)
         self._last_logits_b = st.gv_logits
 
     def _decode_step_rtc(self, st: _State) -> None:
@@ -1474,7 +1480,8 @@ class Engine:
                            lambda s=st: self._decode_step_lean(s, False)))
         candidates.append(("eager_lean",
                            lambda s=st: self._decode_step_lean(s, True)))
-        if self._rtk and getattr(self._rtk, "gf", None):
+        if self._rtk and (getattr(self._rtk, "gf", None)
+                          or getattr(self._rtk, "gf_rt", None)):
             candidates.append(("gdirect",
                                lambda s=st: self._decode_step_gdirect(s)))
             candidates.append(("gstep",
@@ -1774,8 +1781,9 @@ class Engine:
                     break
                 try:
                     if make == "gver":
-                        if not (self._rtk and getattr(self._rtk, "gf", None)
-                                and "emit_finish_k" in self._rtk.gf):
+                        _gf = (getattr(self._rtk, "gf", None)
+                               or getattr(self._rtk, "gf_rt", {}))
+                        if not (self._rtk and "emit_finish_k" in _gf):
                             continue
                         runner = lambda: self._decode_step_gverify(st)
                     elif make == "rms":
@@ -2097,14 +2105,8 @@ class Engine:
             # 4b decode_name | 3b mega-node probe | 1b gn probe
             # status channel: ec*64 | ge*4 | gn  (gf_err is on _rtk)
             ge = getattr(getattr(self, "_rtk", None), "gf_err", 30)
-            ec = min(15, getattr(self, "_gstep_ec", 0))
-            gn = getattr(self, "_gn", 0) & 3
-            # gstep bench ms in units of 0.5ms, clamp 31 -> hi bits
-            gm = getattr(self, "_gstep_ms", -1.0)
-            if gm < 0:
-                gm = getattr(self, "_gdir_ms", -1.0)
-            gmc = 31 if gm < 0 else min(30, int(gm * 2))
-            p = gmc * 32 + min(ge, 7) * 4 + gn
+            gn = getattr(self, "_gn", 0) & 7
+            p = min(int(ge), 127) * 8 + gn
         else:
             # hidden shapes: 4b decode name | 2b leanf | 2b glean
             p = ((dec & 15)

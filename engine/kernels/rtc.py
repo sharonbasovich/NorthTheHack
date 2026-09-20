@@ -1416,11 +1416,38 @@ class RtcKernels:
                         "gemv_silu_k", "rope_kv_k", "attn_k",
                         "argmax_pos_k", "embed_r_k", "rope_kv_r_k",
                         "attn_r_k", "argmax_r_k", "emit_finish_k")
-            for attempt in range(6):
+            self.gf_rt = {}
+            self.gf_mode = 0   # 1=driver, 2=runtime
+            for attempt in range(8):
                 blob = blobs[attempt % len(blobs)] if blobs else None
                 if blob is None:
                     self.gf_err = 8
                     break
+                # runtime-API load first (torch's own path); driver second
+                if self.rtc.rt is not None and attempt % 2 == 0:
+                    lib = ctypes.c_void_p()
+                    rc = self.rtc.rt.cudaLibraryLoadData(
+                        ctypes.byref(lib), ctypes.c_char_p(blob),
+                        None, None, 0, None, None, 0)
+                    self.gf_err = 40 + (rc & 31) if rc else 8
+                    if rc == 0 and lib:
+                        ok = True
+                        for ni, nm in enumerate(fn_names):
+                            f = ctypes.c_void_p()
+                            rc = self.rtc.rt.cudaLibraryGetKernel(
+                                ctypes.byref(f), lib, nm.encode())
+                            if rc or not f:
+                                self.gf_err = 60 + ni
+                                ok = False
+                                break
+                            self.gf_rt[nm] = f
+                        if ok and len(self.gf_rt) == len(fn_names):
+                            self.gf_err = 0
+                            self.gf_mode = 2
+                            break
+                        if not ok:
+                            break
+                    continue
                 gmod = ctypes.c_void_p()
                 rc = self.rtc.cuda.cuModuleLoadData(
                     ctypes.byref(gmod), ctypes.c_char_p(blob))
@@ -1438,6 +1465,7 @@ class RtcKernels:
                         self.gf[nm] = f
                     if ok and len(self.gf) == len(fn_names):
                         self.gf_err = 0
+                        self.gf_mode = 1
                         break
                     self.gf_err = 28 if ok else self.gf_err
         except Exception:
