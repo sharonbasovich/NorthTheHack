@@ -1791,7 +1791,22 @@ class Engine:
                 if min(len(q) for q in queues) > need_i:
                     continue   # unreachable-ish; pending drained above
                 if st.spec_enabled and st.spec_cooldown == 0 and not st.ppending:
-                    m_mean = self._spec_pass(st, queues, hists)
+                    try:
+                        m_mean = self._spec_pass(st, queues, hists)
+                    except Exception:
+                        # spec path failed at runtime — rewind the pos
+                        # advance the runner committed (emit_dev still has
+                        # the per-row emit counts on device), disable spec
+                        # permanently, and fall through to normal decode
+                        try:
+                            st.pos.sub_(
+                                st.emit_dev[:, R].clamp_(0, R))
+                        except Exception:
+                            pass
+                        st.spec_enabled = False
+                        st.spec_name = 66
+                        st.spec_cooldown = 1 << 30
+                        continue
                     st.spec_window.append(m_mean)
                     if len(st.spec_window) >= 8:
                         # verify pays iff emit mean covers its cost vs the
