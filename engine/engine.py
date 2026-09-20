@@ -1960,10 +1960,14 @@ class Engine:
                      else 3)
             var = getattr(self._rtk, "last_variant", 0)
             # 4b decode_name | 3b mega-node probe | 1b gn probe
-            # status channel (10 bits): ec*64 | ge*4 | gn
-            ge = getattr(getattr(self._rtk, "rtc", None), "gf_err", 30)
+            # status channel: ec*64 | ge*4 | gn  (gf_err is on _rtk)
+            ge = getattr(getattr(self, "_rtk", None), "gf_err", 30)
             ec = min(15, getattr(self, "_gstep_ec", 0))
-            p = (ec * 64 + min(ge, 15) * 4 + (getattr(self, "_gn", 0) & 3))
+            gn = getattr(self, "_gn", 0) & 3
+            # gstep bench ms in units of 0.5ms, clamp 31 -> hi bits
+            gm = getattr(self, "_gstep_ms", -1.0)
+            gmc = 31 if gm < 0 else min(30, int(gm * 2))
+            p = gmc * 32 + min(ge, 7) * 4 + gn
         else:
             # hidden shapes: 4b decode name | 2b leanf | 2b glean
             p = ((dec & 15)
