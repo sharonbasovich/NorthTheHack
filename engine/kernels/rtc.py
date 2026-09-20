@@ -1395,35 +1395,51 @@ class RtcKernels:
             self.mega_rt = False
             self.megafn = self.rtc.load_cubin(_raw, "step_all_k")
             self.cub_path = True
-        # fused-step kernels: embedded PTX loaded via cuModuleLoadData
+        # fused-step kernels: cubin (or PTX) via cuModuleLoadData, retried —
+        # transient rc=4/1 observed across shapes
         self.gf = {}
+        self.gf_err = 30
         try:
             import base64
-            gmod = ctypes.c_void_p()
-            blob = None
+            blobs = []
             try:
                 from kernels.gstepcub import GSTEP_CUBIN_B64
-                blob = base64.b64decode(GSTEP_CUBIN_B64)
-            except ImportError:
+                blobs.append(base64.b64decode(GSTEP_CUBIN_B64))
+            except Exception:
+                pass
+            try:
                 from kernels.gstepcub import GSTEP_PTX_B64
-                blob = base64.b64decode(GSTEP_PTX_B64)
-            rc = self.rtc.cuda.cuModuleLoadData(
-                ctypes.byref(gmod), ctypes.c_char_p(blob))
-            self.gf_err = rc if rc else 8
-            if rc == 0 and gmod:
-                for ni, nm in enumerate(
-                        ("embed_k", "rms_k", "gemv_k", "gemv_add_k",
-                         "gemv_silu_k", "rope_kv_k", "attn_k",
-                         "argmax_pos_k")):
-                    f = ctypes.c_void_p()
-                    rc = self.rtc.cuda.cuModuleGetFunction(
-                        ctypes.byref(f), gmod, nm.encode())
-                    if rc or not f:
-                        self.gf_err = 20 + ni
-                        raise RuntimeError(f"missing {nm} rc={rc}")
-                    self.gf[nm] = f
-                self.gf_err = 0 if len(self.gf) == 8 else 28
-        except Exception as _e:
+                blobs.append(base64.b64decode(GSTEP_PTX_B64))
+            except Exception:
+                pass
+            fn_names = ("embed_k", "rms_k", "gemv_k", "gemv_add_k",
+                        "gemv_silu_k", "rope_kv_k", "attn_k",
+                        "argmax_pos_k")
+            for attempt in range(6):
+                blob = blobs[attempt % len(blobs)] if blobs else None
+                if blob is None:
+                    self.gf_err = 8
+                    break
+                gmod = ctypes.c_void_p()
+                rc = self.rtc.cuda.cuModuleLoadData(
+                    ctypes.byref(gmod), ctypes.c_char_p(blob))
+                self.gf_err = rc if rc else 8
+                if rc == 0 and gmod:
+                    ok = True
+                    for ni, nm in enumerate(fn_names):
+                        f = ctypes.c_void_p()
+                        rc = self.rtc.cuda.cuModuleGetFunction(
+                            ctypes.byref(f), gmod, nm.encode())
+                        if rc or not f:
+                            self.gf_err = 20 + ni
+                            ok = False
+                            break
+                        self.gf[nm] = f
+                    if ok and len(self.gf) == len(fn_names):
+                        self.gf_err = 0
+                        break
+                    self.gf_err = 28
+        except Exception:
             self.gf = {}
             if not getattr(self, "gf_err", 0):
                 self.gf_err = 29
