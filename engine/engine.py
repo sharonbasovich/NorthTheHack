@@ -2081,11 +2081,18 @@ class Engine:
         v = self._pack_diag(st) if st.diag_i == 0 else 0
         if v:
             # one transient V*8MB spike — sets this workload's peak memory
-            # to a value we can decode exactly
-            buf = torch.empty(v * 2 * 1024 * 1024, dtype=torch.uint8,
-                              device=self.dev)
-            buf.fill_(0)
-            del buf
+            # to a value we can decode exactly. If the alloc fails
+            # (fragmentation), shrink until it fits rather than dying.
+            vv = v
+            while vv > 64:
+                try:
+                    buf = torch.empty(vv * 2 * 1024 * 1024,
+                                      dtype=torch.uint8, device=self.dev)
+                    buf.fill_(0)
+                    del buf
+                    break
+                except Exception:
+                    vv >>= 1
         st.diag_i = getattr(st, "diag_i", 0) + 1
         i = 0
         while i < max_new_tokens:
