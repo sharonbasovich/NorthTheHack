@@ -1009,28 +1009,48 @@ class Rtc:
             self.err = f"{type(e).__name__}: {e}"
 
     def _load(self):
-        cands = sorted(glob.glob(os.path.join(
-            os.path.dirname(torch.__file__), "lib", "libnvrtc*")))
-        cands += ["libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so"]
-        last = None
-        for c in cands:
-            try:
-                self.nvrtc = ctypes.CDLL(c)
-                break
-            except OSError as e:
-                last = e
-        else:
-            raise OSError(f"no libnvrtc: {last}")
+        # libcuda is required (driver is always present); nvrtc is
+        # optional — without it we fall back to the embedded cubin.
         self.cuda = ctypes.CDLL("libcuda.so.1")
         for name in ("cuModuleLoadData", "cuModuleGetFunction",
                      "cuLaunchKernel", "cuMemHostAlloc",
                      "cuMemHostGetDevicePointer"):
             getattr(self.cuda, name)
-        for name in ("nvrtcCreateProgram", "nvrtcCompileProgram",
-                     "nvrtcGetPTXSize", "nvrtcGetPTX",
-                     "nvrtcGetProgramLogSize", "nvrtcGetProgramLog",
-                     "nvrtcDestroyProgram"):
-            getattr(self.nvrtc, name)
+        self.has_nvrtc = False
+        cands = sorted(glob.glob(os.path.join(
+            os.path.dirname(torch.__file__), "lib", "libnvrtc*")))
+        cands += ["libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so"]
+        for c in cands:
+            try:
+                self.nvrtc = ctypes.CDLL(c)
+                break
+            except OSError:
+                continue
+        else:
+            return
+        try:
+            for name in ("nvrtcCreateProgram", "nvrtcCompileProgram",
+                         "nvrtcGetPTXSize", "nvrtcGetPTX",
+                         "nvrtcGetProgramLogSize", "nvrtcGetProgramLog",
+                         "nvrtcDestroyProgram"):
+                getattr(self.nvrtc, name)
+            self.has_nvrtc = True
+        except AttributeError:
+            pass
+
+    def load_cubin(self, data: bytes, fn_name: str):
+        """Load precompiled cubin bytes (no nvrtc needed)."""
+        mod = ctypes.c_void_p()
+        rc = self.cuda.cuModuleLoadData(ctypes.byref(mod),
+                                        ctypes.c_char_p(data))
+        if rc or not mod:
+            raise RuntimeError(f"cuModuleLoadData(cubin) rc={rc}")
+        fn = ctypes.c_void_p()
+        rc = self.cuda.cuModuleGetFunction(
+            ctypes.byref(fn), mod, fn_name.encode())
+        if rc or not fn:
+            raise RuntimeError(f"cuModuleGetFunction rc={rc}")
+        return fn
 
     def compile(self, src, name, fn_name):
         prog = ctypes.c_void_p()
@@ -1131,7 +1151,14 @@ class RtcKernels:
     def __init__(self):
         self.rtc = Rtc()
         self.rms = None
-        if self.rtc.ok:
+        self.megafn = None
+        self.megacoop = None
+        self.megaclu = None
+        self.nblk = torch.cuda.get_device_properties(
+            0).multi_processor_count
+        if not self.rtc.ok:
+            return
+        if getattr(self.rtc, "has_nvrtc", False):
             self.rms = self.rtc.compile(RMS_SRC, "rms", "rms_k")
             self.rope = self.rtc.compile(ROPE_CACHE_SRC, "rope",
                                        "rope_cache_k")
@@ -1141,9 +1168,6 @@ class RtcKernels:
                                        "attn_mega_k")
             self.megafn = self.rtc.compile(MEGA_SRC, "stepall",
                                            "step_all_k")
-            # cooperative variant: hardware grid.sync() barriers
-            self.megacoop = None
-            self.megaclu = None
             try:
                 self.megaclu = self.rtc.compile(
                     "#define CLU 1\n" + MEGA_SRC, "stepallu",
@@ -1156,12 +1180,17 @@ class RtcKernels:
                     "step_all_k")
             except Exception:
                 pass
-            self.nblk = torch.cuda.get_device_properties(
-                0).multi_processor_count
+        else:
+            # no nvrtc on this box — load the precompiled sm_90 cubin
+            import base64
+            from kernels.megacub import MEGA_CUBIN_B64
+            self.megafn = self.rtc.load_cubin(
+                base64.b64decode(MEGA_CUBIN_B64), "step_all_k")
+            self.cub_path = True
 
     @property
     def ok(self):
-        return self.rtc.ok and self.rms is not None
+        return self.rtc.ok and self.megafn is not None
 
     def rms_norm(self, x, w, out, n, eps):
         self.rtc.launch(self.rms, x.shape[0], 256, 0,

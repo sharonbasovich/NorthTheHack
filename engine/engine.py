@@ -1153,10 +1153,11 @@ class Engine:
             if st.B <= getattr(self._rtk, "nblk", 0):
                 candidates.append(("mega_all",
                                    lambda s=st: self._decode_all(s)))
-            candidates.append(("eager_rtc2",
-                               lambda s=st: self._decode_step_rtc2(s)))
-            candidates.append(("eager_rtc",
-                               lambda s=st: self._decode_step_rtc(s)))
+            if getattr(self._rtk, "rms", None) is not None:
+                candidates.append(("eager_rtc2",
+                                   lambda s=st: self._decode_step_rtc2(s)))
+                candidates.append(("eager_rtc",
+                                   lambda s=st: self._decode_step_rtc(s)))
         # try the graph capture even when the probe failed — probes have
         # been flaky under gVisor and a real capture attempt fails fast.
         candidates.append(("graph_slow", self._decode_step_slow))
