@@ -474,8 +474,8 @@ class Engine:
         and (optionally) F.rms_norm — fewer kernel launches per layer.
         Margin-gated identically to every other candidate."""
         B = st.B
-        rms = (lambda x, w: F.rms_norm(x, (x.shape[-1],), w, EPS)
-               if rms_fast else _rms)
+        rms = (_rms if not rms_fast
+               else (lambda x, w: F.rms_norm(x, (x.shape[-1],), w, EPS)))
         x = F.embedding(st.cur, self.embed_w)
         Mb = self._rope_matrix(st).index_select(0, st.pos).unsqueeze(1)
         nvalid = st.srange[None, :] > st.pos[:, None]
