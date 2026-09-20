@@ -1593,7 +1593,7 @@ class Engine:
             cms = getattr(self, "_mega_cmp_ms", -1.0)
             ccode = (0 if cms < 3 else 1 if cms < 6 else 2 if cms < 10
                      else 3)
-            var = getattr(self.rk, "last_variant", 0)
+            var = getattr(self._rtk, "last_variant", 0)
             # variant: 0 none, 1 cluster, 2 coop, 3 software
             p = ((dec & 3)
                  | ((getattr(self, "_mega_adopted", 0) & 1) << 2)
