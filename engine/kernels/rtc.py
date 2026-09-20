@@ -890,13 +890,13 @@ extern "C" __global__ void step_all_k(
     float* logb = logits + (long long)b * VDIM;
 
     for (int step_i = 0; step_i < ntok; ++step_i) {
-    // embed: every block reads cur[b] and writes hidb — identical,
-    // no barrier needed before the redundant norm
-    {
+    // embed current token into residual stream
+    if (loc == 0) {
         long long tok = cur[b];
         const bf16* e = embed + tok * (long long)HDIM;
         for (int i = tid; i < HDIM; i += NT) hidb[i] = e[i];
     }
+    GB();
 
     for (int l = 0; l < NL; ++l) {
         const bf16* w_ln_in = (const bf16*)lw[l * 10 + 0];
@@ -910,8 +910,9 @@ extern "C" __global__ void step_all_k(
         bf16* kcb           = (bf16*)lw[l * 10 + 8];
         bf16* vcb           = (bf16*)lw[l * 10 + 9];
 
-        // every block norms redundantly — identical writes, no barrier
-        rms_row(hidb, w_ln_in, h + (long long)b * HDIM, eps, red);
+        if (loc == 0) rms_row(hidb, w_ln_in, h + (long long)b * HDIM,
+                              eps, red);
+        GB();
         gemv_g(wqkv, h + (long long)b * HDIM, qkvb, QKVD, HDIM, 0, 0,
                0, gwl, nwl);
         GB();
@@ -924,7 +925,9 @@ extern "C" __global__ void step_all_k(
         GB();
         gemv_g(wo, obufb, hidb, HDIM, ODIM, hidb, 0, 0, gwl, nwl);
         GB();
-        rms_row(hidb, w_ln2, h2 + (long long)b * HDIM, eps, red);
+        if (loc == 0) rms_row(hidb, w_ln2, h2 + (long long)b * HDIM,
+                              eps, red);
+        GB();
         gemv_g(wgu, h2 + (long long)b * HDIM, gub, GDIM, HDIM, 0, 0,
                0, gwl, nwl);
         GB();
@@ -932,7 +935,9 @@ extern "C" __global__ void step_all_k(
         GB();
     }
 
-    rms_row(hidb, finw, h + (long long)b * HDIM, eps, red);
+    if (loc == 0) rms_row(hidb, finw, h + (long long)b * HDIM, eps,
+                          red);
+    GB();
     gemv_gf(embed, h + (long long)b * HDIM, logb, VDIM, HDIM,
             gwl, nwl);
     GB();
