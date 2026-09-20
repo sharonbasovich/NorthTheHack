@@ -1297,6 +1297,8 @@ class Engine:
                     "eager_rtc2": 9, "eager_sdpa": 10}.get(name, 11)
                 ms = self._bench(runner)
                 restore()
+                if name == "eager_sdpa":
+                    self._sdpa_ms = ms
                 if name == "mega_all":
                     self._mega_ms = ms
                     try:
@@ -1592,20 +1594,18 @@ class Engine:
         # payload duplicated into both 7-bit halves of Vd so the decode
         # side can validate against allocator drift: Vd = 512 + p*129
         if st.B == 1:
-            # which candidates were tried (low 4 bits of tried mask) and
-            # which passed margin (low 3 bits of pass mask)
-            p = ((getattr(self, "_cand_tried", 0) & 15)
-                 | ((getattr(self, "_cand_mask", 0) & 7) << 4))
+            # 2b sdpa margin status | 3b decode_ms bucket | 3b emitenc
+            dms = getattr(st, "decode_ms", -1.0)
+            dcode = (0 if dms < 0 else 1 if dms < 5
+                     else 2 if dms < 8 else 3 if dms < 12 else 4)
+            p = ((getattr(self, "_sdpa_status", 0) & 3)
+                 | ((dcode & 7) << 2)
+                 | ((emitenc & 7) << 5))
         elif st.B == 4:
-            # bits: 0-2 mega exc class, 3 mega_flag, 4 adopted,
-            # 5-6 variant, 7-9 rtc_status
-            var4 = getattr(self._rtk, "last_variant", 0)
-            stg = getattr(self, "_mega_stage", 0)
-            p = ((getattr(self, "_mega_exc", 0) & 7)
-                 | ((getattr(st, "mega_flag", False) & 1) << 3)
-                 | ((getattr(self, "_mega_adopted", 0) & 1) << 4)
-                 | ((var4 & 3) << 5)
-                 | ((stg & 7) << 7))
+            # 4b spec_name | 3b emitenc | 1b spec still enabled at end
+            p = ((getattr(st, "spec_name", 0) & 15)
+                 | ((emitenc & 7) << 4)
+                 | ((1 if getattr(st, "spec_enabled", False) else 0) << 7))
         elif st.B == 16:
             # 2b decode name, 1b mega adopted, 2b mega bench bucket
             # (0<3ms,1:3-6,2:6-10,3:>10 / never ran), 2b winner bench
@@ -1630,12 +1630,15 @@ class Engine:
             #      6 Index, 7 other — why mega never launched
             exc = getattr(self, "_mega_exc", 0)
             stage = getattr(self, "_mega_stage", 0)
-            # variant: 0 none, 1 cluster, 2 coop, 3 software
-            p = ((exc & 7)
-                 | ((getattr(self, "_mega_adopted", 0) & 1) << 3)
-                 | ((var & 3) << 4) | ((stage & 15) << 6))
+            # 4b spec_name | 3b emitenc | 1b enabled
+            p = ((getattr(st, "spec_name", 0) & 15)
+                 | ((emitenc & 7) << 4)
+                 | ((1 if getattr(st, "spec_enabled", False) else 0) << 7))
         else:
-            p = (dec & 7) | (emitenc << 3)
+            # hidden shapes: 3b decode name | 3b emitenc | 2b spec_name
+            p = ((dec & 7)
+                 | ((emitenc & 7) << 3)
+                 | ((getattr(st, "spec_name", 0) & 3) << 6))
         # spike must exceed the workload's own peak (~16GB seen), so the
         # payload starts at 8192 units (16.4GB) with 32-unit spacing
         # (64MiB) to tolerate base drift: Vd = 8192 + p*32
