@@ -1215,6 +1215,12 @@ class Engine:
                 elif name in ("eager_fast", "eager_rms", "eager_sdpa",
                               "eager_rtc", "eager_rtc2", "mega_all"):
                     runner = what
+                    if name == "mega_all":
+                        # bisect: bench=3 exercises launch+probe+flag only;
+                        # flag -333 keeps mega_flag false (never adopted)
+                        self._mega_stage = 6
+                        self._decode_all(st, 1, 3)
+                        runner = lambda s=st: self._decode_all(s, 1, 3)
                     runner()
                     ok = self._margin_ok(ref_logits, st.cur[:, 0], 1.9)
                     if name == "mega_all":
@@ -1223,6 +1229,7 @@ class Engine:
                         torch.cuda.synchronize()
                         st.mega_flag = bool(
                             min(st.m_flagtok[:st.B].tolist()) > 0)
+                        ok = False   # bench probe — never adopt yet
                     if name == "eager_rtc":
                         self._rtc_status = 1 if ok else 2
                     if name == "eager_sdpa":

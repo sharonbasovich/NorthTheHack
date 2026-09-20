@@ -364,7 +364,7 @@ extern "C" __device__ void cudaCGSynchronizeGrid(unsigned long long);
 #define HDIM 2560
 #define VDIM 151936
 #define IDIM 9728
-#define QKVD 4608
+#define QKVD 6144
 #define ODIM 4096
 #define GDIM 19456
 
@@ -896,10 +896,14 @@ extern "C" __global__ void step_all_k(
         }
     }
 
-    if (bench == 1) {
+    if (bench == 3) {   // probe only: launch+residency work, nothing else
+        if (loc == 0 && tid == 0) flag[b] = -333;
+        return;
+    }
+    if (bench == 1) {   // barriers only — flag -555 keeps margin rejecting
         for (int s = 0; s < ntok; ++s) {
             for (int i = 0; i < NL * 6 + 4; ++i) gbar(gcnt, ggen);
-            if (loc == 0 && tid == 0) flag[b] = (long long)(s + 1);
+            if (loc == 0 && tid == 0) flag[b] = -555;
         }
         return;
     }
