@@ -1420,6 +1420,13 @@ class Engine:
                 else:
                     self._dbg("cand %s margin_fail" % name)
             except Exception as e:
+                if name in ("eager_lean", "eager_leanr", "eager_sdpa"):
+                    en = type(e).__name__
+                    code = (1 if "Type" in en else 2 if "Runtime" in en
+                            else 3)
+                    setattr(self, "_%s_exc" %
+                            {"eager_lean": "leanf", "eager_leanr": "leanr",
+                             "eager_sdpa": "sdpa"}[name], code)
                 if name == "mega_all":
                     en = type(e).__name__
                     self._mega_exc = (
@@ -1678,10 +1685,11 @@ class Engine:
         # payload duplicated into both 7-bit halves of Vd so the decode
         # side can validate against allocator drift: Vd = 512 + p*129
         if st.B == 1:
-            # 4b decode_name | 2b sdpa_status | 2b leanf (F.rms_norm) status
+            # 4b decode_name | 2b leanf status | 2b leanf exc class
+            # (exc: 1=Type 2=Runtime 3=other; status 0=threw)
             p = ((getattr(st, "decode_name", 0) & 15)
-                 | ((getattr(self, "_sdpa_status", 0) & 3) << 4)
-                 | ((getattr(self, "_leanf_status", 0) & 3) << 6))
+                 | ((getattr(self, "_leanf_status", 0) & 3) << 4)
+                 | ((getattr(self, "_leanf_exc", 0) & 3) << 6))
         elif st.B == 4:
             # 4b decode_name | 2b leanr (rope-matmul) status | 2b graph_lean
             p = ((getattr(st, "decode_name", 0) & 15)
