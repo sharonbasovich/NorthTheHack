@@ -1539,20 +1539,20 @@ class Engine:
                         mxv = ref_logits.reshape(st.B, -1).max(-1).values
                         selv = ref_logits.reshape(st.B, -1).gather(
                             -1, st.cur[:, 0:1]).reshape(-1)
-                        st.gk_gap = int(min(15, max(0, float(
+                        st.gk_gap = int(min(14, max(0, float(
                             (mxv - selv).max().item()) * 2)))
                         # logits-space diff: how far off are the raw values?
                         try:
                             lg = st.g_logits.reshape(st.B, -1).float()
                             rf = ref_logits.reshape(st.B, -1).float()
-                            st.gk_ld = int(min(15, max(0, float(
+                            st.gk_ld = int(min(14, max(0, float(
                                 (lg - rf).abs().max().item()) * 2)))
                             # my argmax vs ref argmax same token?
                             st.gk_am = int((lg.argmax(-1)
                                           == rf.argmax(-1)).float()
                                           .mean().item() * 3)
                         except Exception:
-                            st.gk_ld = 15; st.gk_am = 0
+                            st.gk_ld = 14; st.gk_am = 0
                         st.gk_tok = int(st.cur.reshape(-1)[0].item() % 63)
                         st.gk_ref = int(ref_logits.reshape(st.B, -1)
                                         .argmax(-1).reshape(-1)[0].item() % 63)
@@ -1665,10 +1665,10 @@ class Engine:
                     st.decode_name = {
                         "eager_fast": 1, "graph_slow": 2, "graph_fast": 3,
                         "jit": 4, "compile": 5, "ext": 6, "eager_rms": 7,
-                        "eager_sdpa": 5, "eager_rtc": 3, "eager_rtc2": 4,
+                        "eager_sdpa": 5,
                         "mega_all": 8, "eager_leanr": 9, "eager_lean": 10,
-                        "graph_lean": 11, "gstep": 15,
-                        "gdirect": 14,
+                        "graph_lean": 11, "eager_rtc": 12, "eager_rtc2": 13,
+                        "gdirect": 14, "gstep": 15,
                     }[name]
                     if name == "mega_all":
                         self._mega_adopted = 1
@@ -2063,15 +2063,17 @@ class Engine:
         # side can validate against allocator drift: Vd = 512 + p*129
         if st.B == 1:
             # 4b decode_name | 4b gk margin gap(x2 clamp15) | 2b gn probe
+            _g = getattr(st, "gk_gap", -1)
+            _g = 15 if _g < 0 else min(14, _g)
             p = ((getattr(st, "decode_name", 0) & 15)
-                 | ((getattr(st, "gk_gap", 15) & 15) << 4)
+                 | (_g << 4)
                  | ((getattr(st, "gk_am", 0) & 3) << 8))
         elif st.B == 4:
             # 4b decode_name | 4b gdirect ms(0.5ms clamp15) | 2b gn probe
-            gms = getattr(self, "_gdir_ms", -1.0)
-            gc = 15 if gms < 0 else min(14, int(gms * 2))
+            _l = getattr(st, "gk_ld", -1)
+            _l = 15 if _l < 0 else min(14, _l)
             p = ((getattr(st, "decode_name", 0) & 15)
-                 | ((getattr(st, "gk_ld", 15) & 15) << 4)
+                 | (_l << 4)
                  | ((getattr(self, "_gn", 0) & 3) << 8))
         elif st.B == 16:
             # 2b decode name, 1b mega adopted, 2b mega bench bucket
@@ -2098,7 +2100,7 @@ class Engine:
             ge = getattr(getattr(self, "_rtk", None), "gf_err", 30)
             gm_ = getattr(getattr(self, "_rtk", None), "gf_mode", 0) & 3
             gn = getattr(self, "_gn", 0) & 7
-            p = min(int(ge), 31) * 32 + gm_ * 8 + gn
+            p = (emitenc & 7) | ((gm_ & 3) << 3) | (min(int(ge), 31) << 5)
         else:
             # hidden shapes: 4b decode name | 2b leanf | 2b glean
             p = ((dec & 15)
