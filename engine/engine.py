@@ -1009,13 +1009,19 @@ class Engine:
         self._drain(st.emit_pin)
         ep = st.emit_pin.tolist()
         tot = 0
+        lasts = []
         for b in range(B):
             m_b = ep[b][R]
             tot += m_b
+            lasts.append(ep[b][m_b - 1])
             for j in range(m_b):
                 t = ep[b][j]
                 queues[b].append(t)
                 hists[b].append(t)
+        # resync the decode-step input: `cur` must hold the last emitted
+        # token or a later single-step decode reads a stale context
+        st.cur[:, 0].copy_(
+            torch.tensor(lasts, dtype=torch.int64, pin_memory=True))
         st.emit_sum += tot
         st.emit_n += B
         return tot / B
@@ -1353,8 +1359,6 @@ class Engine:
         self._batch_err = 15   # 15 = threw inside the step call itself
         try:
             self._decode_step_slow_batch(st)
-            self._batch_err = 16   # survived the batch step itself
-            raise _SkipSpec()
             self._batch_err = 1
             ref_logits_b = self._last_logits_b.clone().view(st.B, R, V)
             self._batch_err = 2
