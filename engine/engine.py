@@ -1600,8 +1600,10 @@ class Engine:
                  | ((var & 3) << 3) | (bcode << 5))
         else:
             p = (dec & 7) | (emitenc << 3)
-        # CALIBRATION RUN: fixed p=0 → peak = base + 16.4GiB exactly
-        return 8192
+        # spike must exceed the workload's own peak (~16GB seen), so the
+        # payload starts at 8192 units (16.4GB) with 64-unit spacing to
+        # tolerate base drift: Vd = 8192 + p*64
+        return 8192 + min(p, 127) * 64
 
     # ------------------------------------------------------------------
     # Partial-fused variants: Triton rmsnorm/silu_mul only, torch attention
