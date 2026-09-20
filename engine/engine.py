@@ -1276,7 +1276,10 @@ class Engine:
                         self._mega_bar_ms = -1.0
                 if name == "graph_slow" and not (ms < st.decode_ms):
                     self._gerr = 4
-                if ms < st.decode_ms:
+                # mega bench includes a host sync; its real loop never
+                # syncs, so adopt unconditionally once margin-correct
+                if ms < st.decode_ms or (name == "mega_all"
+                                         and st.mega_flag):
                     st.decode_ms = ms
                     st.decode_runner = runner
                     st.decode_name = {
