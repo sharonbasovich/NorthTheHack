@@ -1356,6 +1356,7 @@ class RtcKernels:
         self.gn_ok = False
         self._gn_cache = {}
         self.gn_err = (0, 0)
+        self.gf_err = 30
         self.megacoop = None
         self.megaclu = None
         self.nblk = torch.cuda.get_device_properties(
@@ -1403,18 +1404,24 @@ class RtcKernels:
             rc = self.rtc.cuda.cuModuleLoadData(
                 ctypes.byref(gmod), ctypes.c_char_p(
                     base64.b64decode(GSTEP_PTX_B64)))
+            self.gf_err = rc if rc else 8
             if rc == 0 and gmod:
-                for nm in ("embed_k", "rms_k", "gemv_k", "gemv_add_k",
-                           "gemv_silu_k", "rope_kv_k", "attn_k",
-                           "argmax_pos_k"):
+                for ni, nm in enumerate(
+                        ("embed_k", "rms_k", "gemv_k", "gemv_add_k",
+                         "gemv_silu_k", "rope_kv_k", "attn_k",
+                         "argmax_pos_k")):
                     f = ctypes.c_void_p()
                     rc = self.rtc.cuda.cuModuleGetFunction(
                         ctypes.byref(f), gmod, nm.encode())
                     if rc or not f:
+                        self.gf_err = 20 + ni
                         raise RuntimeError(f"missing {nm} rc={rc}")
                     self.gf[nm] = f
+                self.gf_err = 0 if len(self.gf) == 8 else 28
         except Exception as _e:
             self.gf = {}
+            if not getattr(self, "gf_err", 0):
+                self.gf_err = 29
 
     @property
     def ok(self):
