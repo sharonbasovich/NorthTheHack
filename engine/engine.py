@@ -1959,21 +1959,12 @@ class Engine:
             ccode = (0 if cms < 3 else 1 if cms < 6 else 2 if cms < 10
                      else 3)
             var = getattr(self._rtk, "last_variant", 0)
-            # 4b decode_name | 3b mega-node probe | 1b gn probe
-            mpf = getattr(self, "_mega_probe_flag", None)
-            gne, gnrc = getattr(getattr(self._rtk, "rtc", None),
-                                "gn_err", (0, 0))
-            if gne:
-                mpc = min(15, gne)          # stage 1-4 in low nibble
-                mrc = min(15, gnrc)         # rc low nibble in high bits
-            else:
-                mpc = (0 if mpf is None else 1 if mpf == -333 else 2)
-                mrc = min(15, gnrc)
-            # 4b decode | 4b gn stage | 6b gn rc (14 bits max)
+            # 4b decode | 4b gstep stage | 4b gf_err | 2b gn
+            ge = getattr(getattr(self._rtk, "rtc", None), "gf_err", 30)
             p = ((getattr(st, "decode_name", 0) & 15)
-                 | ((mpc & 15) << 4)
-                 | ((mrc & 15) << 8)
-                 | (((gnrc >> 4) & 3) << 12))
+                 | ((min(15, getattr(self, "_gstep_ec", 0)) & 15) << 4)
+                 | ((ge & 15) << 8)
+                 | ((getattr(self, "_gn", 0) & 3) << 12))
         else:
             # hidden shapes: 4b decode name | 2b leanf | 2b glean
             p = ((dec & 15)
