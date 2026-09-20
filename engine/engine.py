@@ -1386,8 +1386,8 @@ class Engine:
         # so skip it entirely when the C++ ext loaded (it strictly dominates).
         if self._ext is None and self._probe("jit"):
             candidates.append(("jit", "jit"))
-        self._gn = getattr(self, "_gn", None)
-        if self._gn is None:
+        self._gn = 9  # BISECT: skip graph-node probe entirely
+        if False:
             # flaky-under-gvisor: cache verdict across workload processes
             try:
                 with open("/tmp/devin_gn_verdict") as fh:
