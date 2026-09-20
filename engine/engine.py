@@ -1815,13 +1815,12 @@ class Engine:
                     j = st.m_j = getattr(st, "m_j", 0)
                     _d0 = time.perf_counter()
                     want = j + 1
-                    cu = self._rtk.rtc.cuda
-                    sh = st.m_pstream.cuda_stream
-                    hp = ctypes.c_void_p(st.m_hflag.data_ptr())
-                    fp = ctypes.c_void_p(st.m_mapdev)
+                    ps = st.m_pstream
                     while True:
-                        cu.cuMemcpyDtoHAsync(hp, fp, 8 * B, sh)
-                        while cu.cuStreamQuery(ctypes.c_void_p(sh)):
+                        with torch.cuda.stream(ps):
+                            st.m_hflag.copy_(st.m_flagtok[:B],
+                                             non_blocking=True)
+                        while not ps.query():
                             pass
                         if min(st.m_hflag.tolist()) >= want:
                             break
@@ -1831,17 +1830,16 @@ class Engine:
                             # last committed step, so the normal runner
                             # resumes correctly
                             st.mega_flag = False
-                            st.m_j = getattr(st, "m_j", 0)
                             self._mega_dead = True
                             break
                     if not st.mega_flag:
                         break
                     # flag ok — fetch this step's token row
-                    tp = ctypes.c_void_p(
-                        st.m_mapdev + 8 * B + j * B * 8)
-                    th = ctypes.c_void_p(st.m_htok.data_ptr())
-                    cu.cuMemcpyDtoHAsync(th, tp, 8 * B, sh)
-                    while cu.cuStreamQuery(ctypes.c_void_p(sh)):
+                    with torch.cuda.stream(ps):
+                        st.m_htok.copy_(
+                            st.m_flagtok[B + j * B: B + j * B + B],
+                            non_blocking=True)
+                    while not ps.query():
                         pass
                     _dt = time.perf_counter() - _d0
                     st.t_drain += _dt
