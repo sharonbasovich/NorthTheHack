@@ -1044,6 +1044,28 @@ class Rtc:
                      "cuMemHostGetDevicePointer"):
             getattr(self.cuda, name)
         self.has_nvrtc = False
+        # cuda runtime (nvidia-cuda-runtime pip dep ships libcudart.so.12) —
+        # launches go through the same runtime API torch itself uses
+        self.rt = None
+        _td = os.path.dirname(torch.__file__)
+        rtcands = sorted(glob.glob(os.path.join(
+            _td, "..", "nvidia", "cuda_runtime", "lib", "libcudart*")))
+        rtcands += sorted(glob.glob(os.path.join(
+            _td, "lib", "libcudart*")))
+        rtcands += ["libcudart.so.12", "libcudart.so"]
+        for c in rtcands:
+            try:
+                self.rt = ctypes.CDLL(c)
+                break
+            except OSError:
+                continue
+        if self.rt is not None:
+            try:
+                for n in ("cudaLibraryLoadData", "cudaLibraryGetKernel",
+                          "cudaLaunchKernelExC"):
+                    getattr(self.rt, n)
+            except AttributeError:
+                self.rt = None
         cands = sorted(glob.glob(os.path.join(
             os.path.dirname(torch.__file__), "lib", "libnvrtc*")))
         cands += ["libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so"]
@@ -1078,6 +1100,45 @@ class Rtc:
         if rc or not fn:
             raise RuntimeError(f"cuModuleGetFunction rc={rc}")
         return fn
+
+    def load_cubin_rt(self, data: bytes, fn_name: str):
+        """Load cubin through the CUDA runtime API (cudaLibrary*)."""
+        lib = ctypes.c_void_p()
+        rc = self.rt.cudaLibraryLoadData(
+            ctypes.byref(lib), ctypes.c_char_p(data),
+            None, None, 0, None, None, 0)
+        if rc or not lib:
+            raise RuntimeError(f"cudaLibraryLoadData rc={rc}")
+        kern = ctypes.c_void_p()
+        rc = self.rt.cudaLibraryGetKernel(
+            ctypes.byref(kern), lib, fn_name.encode())
+        if rc or not kern:
+            raise RuntimeError(f"cudaLibraryGetKernel rc={rc}")
+        return kern
+
+    def launch_rt(self, kern, grid, block, smem, args):
+        """Launch via cudaLaunchKernelExC — same API torch uses."""
+        class _Cfg(ctypes.Structure):
+            _fields_ = [
+                ("gridDimX", ctypes.c_uint32),
+                ("gridDimY", ctypes.c_uint32),
+                ("gridDimZ", ctypes.c_uint32),
+                ("blockDimX", ctypes.c_uint32),
+                ("blockDimY", ctypes.c_uint32),
+                ("blockDimZ", ctypes.c_uint32),
+                ("dynamicSmemBytes", ctypes.c_size_t),
+                ("stream", ctypes.c_void_p),
+                ("attrs", ctypes.c_void_p),
+                ("numAttrs", ctypes.c_uint32),
+            ]
+        arr = (ctypes.c_void_p * len(args))(
+            *[ctypes.addressof(a) for a in args])
+        stream = torch.cuda.current_stream().cuda_stream
+        cfg = _Cfg(grid, 1, 1, block, 1, 1, smem,
+                   ctypes.c_void_p(stream), None, 0)
+        rc = self.rt.cudaLaunchKernelExC(ctypes.byref(cfg), kern, arr)
+        if rc:
+            raise RuntimeError(f"cudaLaunchKernelExC rc={rc}")
 
     def compile(self, src, name, fn_name):
         prog = ctypes.c_void_p()
@@ -1208,11 +1269,22 @@ class RtcKernels:
             except Exception:
                 pass
         else:
-            # no nvrtc on this box — load the precompiled sm_90 cubin
+            # no nvrtc on this box — load the precompiled sm_90 cubin.
+            # prefer the runtime API (same launch path torch uses);
+            # fall back to the driver API.
             import base64
             from kernels.megacub import MEGA_CUBIN_B64
-            self.megafn = self.rtc.load_cubin(
-                base64.b64decode(MEGA_CUBIN_B64), "step_all_k")
+            _raw = base64.b64decode(MEGA_CUBIN_B64)
+            self.mega_rt = False
+            if self.rtc.rt is not None:
+                try:
+                    self.megafn = self.rtc.load_cubin_rt(
+                        _raw, "step_all_k")
+                    self.mega_rt = True
+                except Exception:
+                    self.megafn = None
+            if self.megafn is None:
+                self.megafn = self.rtc.load_cubin(_raw, "step_all_k")
             self.cub_path = True
 
     @property
@@ -1326,13 +1398,15 @@ class RtcKernels:
                 self.coop_ok = False
                 self.megacoop = None
         self.last_variant = 3
-        self.rtc.launch(self.megafn, self.nblk, 1024, smem,
-                        [ptr(lw), ptr(embed), ptr(finw), ptr(cost),
-                         ptr(sint), ptr(pos), ptr(cur), ptr(hid),
-                         ptr(hbuf), ptr(qkv), ptr(obuf), ptr(gu),
-                         ptr(logits), ptr(amaxv), ptr(amaxi),
-                         ptr(cnt), ptr(gen),
-                         ctypes.c_void_p(flag_dev),
-                         ctypes.c_void_p(tokm_dev),
-                         i32(B), i32(NL), i32(ntok), f32(eps), i64(cap),
-                         i32(bench)])
+        _args = [ptr(lw), ptr(embed), ptr(finw), ptr(cost),
+                 ptr(sint), ptr(pos), ptr(cur), ptr(hid),
+                 ptr(hbuf), ptr(qkv), ptr(obuf), ptr(gu),
+                 ptr(logits), ptr(amaxv), ptr(amaxi),
+                 ptr(cnt), ptr(gen),
+                 ctypes.c_void_p(flag_dev), ctypes.c_void_p(tokm_dev),
+                 i32(B), i32(NL), i32(ntok), f32(eps), i64(cap),
+                 i32(bench)]
+        if getattr(self, "mega_rt", False):
+            self.rtc.launch_rt(self.megafn, self.nblk, 1024, smem, _args)
+        else:
+            self.rtc.launch(self.megafn, self.nblk, 1024, smem, _args)
