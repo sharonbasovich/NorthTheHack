@@ -1167,7 +1167,7 @@ class Engine:
         if self._rtk:
             # mega first: it is the best path when it works and must never
             # be starved by a slow graph-capture attempt ahead of it
-            if st.B <= getattr(self._rtk, "nblk", 0):
+            if False and st.B <= getattr(self._rtk, "nblk", 0):
                 candidates.append(("mega_all",
                                    lambda s=st: self._decode_all(s)))
             if getattr(self._rtk, "rms", None) is not None:
@@ -1352,15 +1352,6 @@ class Engine:
         ref_logits_b = None
         self._batch_err = 15   # 15 = threw inside the step call itself
         try:
-            if True:
-                st.spec_name = 9
-                raise _SkipSpec()
-            if st.B * R > 48:
-                # verify pass scales with B*R rows — past ~48 rows it is
-                # compute-bound and loses to plain decode (v25: B=16 ran
-                # 15.4ms/tok vs 9.7). Marker 8 = skipped-by-shape.
-                st.spec_name = 8
-                raise _SkipSpec()
             self._decode_step_slow_batch(st)
             self._batch_err = 1
             ref_logits_b = self._last_logits_b.clone().view(st.B, R, V)
