@@ -1877,6 +1877,27 @@ class Engine:
                 self._cl = 1 if int(out2[0].item()) == 1234 else 3
             except Exception:
                 self._cl = 2
+            # stage 3: how many nodes can one graph hold/launch?
+            self._gmax = 0
+            try:
+                rtc = getattr(getattr(self, "_rtk", None), "rtc", None)
+                if rtc is None:
+                    raise RuntimeError("no rtc")
+                out3 = torch.zeros(4, dtype=torch.int32,
+                                   device=st.cur.device)
+                for n in (2, 8, 64, 200, 400):
+                    specs = []
+                    for _ in range(n):
+                        specs.append((fn, 1, 32, 0,
+                                      [ctypes.c_void_p(
+                                          out3.data_ptr())]))
+                    rp = rtc.build_node_graph(specs)
+                    rp()
+                    torch.cuda.synchronize()
+                    if int(out3[0].item()) == 1234:
+                        self._gmax = n
+            except Exception:
+                pass
             return 1
         except Exception:
             return 9
@@ -1924,9 +1945,11 @@ class Engine:
                  | ((getattr(self, "_gn", 0) & 7) << 4)
                  | ((getattr(self, "_leanf_exc", 0) & 3) << 7))
         elif st.B == 4:
-            # 4b decode_name | 3b capture-launch probe | 1b gn probe
+            # 4b decode_name | 3b max-node bucket | 1b gn probe
+            gm = getattr(self, "_gmax", 0)
+            gmc = {0: 0, 2: 1, 8: 2, 64: 3, 200: 4, 400: 5}.get(gm, 6)
             p = ((getattr(st, "decode_name", 0) & 15)
-                 | ((getattr(self, "_cl", 0) & 7) << 4)
+                 | ((gmc & 7) << 4)
                  | ((getattr(self, "_gn", 0) & 1) << 7))
         elif st.B == 16:
             # 2b decode name, 1b mega adopted, 2b mega bench bucket
