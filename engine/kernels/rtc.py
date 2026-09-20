@@ -731,8 +731,9 @@ __device__ void attn_unit(int b, int j, const bf16* row,
                           bf16* out, long long cap,
                           float scale, float eps,
                           float* red, bf16* srope, float* scores) {
-    int d = threadIdx.x;   // < 128 guaranteed by caller guard
-    if (d >= 128) return;
+    // all NT threads run redundantly in groups of 128 — identical
+    // computes and writes, no divergent barriers
+    int d = threadIdx.x & 127;
     const bf16* cosb = cost + p * 128;
     const bf16* sinb = sint + p * 128;
     // write k/v cache entries
