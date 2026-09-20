@@ -525,12 +525,10 @@ class Engine:
         st.pos.add_(1)
 
 
-    def _decode_step_gstep(self, st: _State) -> None:
-        """Whole decode step as per-layer driver graphs of custom kernel
-        nodes — ~38 sequential graph launches, zero host dispatch."""
+    def _gstep_build(self, st) -> None:
         rk = self._rtk
         B = st.B
-        if getattr(st, "g_rl", None) is None:
+        if getattr(st, "g_spec", None) is None:
             self._gstep_ec = 1
             dev = self.dev
             bf = torch.bfloat16
@@ -542,7 +540,8 @@ class Engine:
             st.g_gu = torch.zeros(B, 2 * I, dtype=bf, device=dev)
             st.g_m = torch.zeros(B, I, dtype=bf, device=dev)
             st.g_logits = torch.zeros(B, V, dtype=bf, device=dev)
-            st.g_rl = []          # list of replay closures, in order
+            st.g_rl = []
+            st.g_spec = []
             import ctypes
 
             def P(t):
@@ -557,13 +556,12 @@ class Engine:
             def F32(v):
                 return ctypes.c_float(v)
             gf = rk.gf
-            rl = st.g_rl
             nodes = []
             # embed: x = emb[cur]
             nodes.append((gf["embed_k"], (B * H + 255) // 256, 256, 0,
                           [P(self.embed_w), P(st.cur), P(st.g_x),
                            I32(H), I32(B)]))
-            rl.append(rk.rtc.build_node_graph(nodes))
+            st.g_spec.append(list(nodes))
             self._gstep_ec = 2
             for i, w in enumerate(self.layers):
                 nodes = []
@@ -604,7 +602,7 @@ class Engine:
                 nodes.append((gf["gemv_add_k"], B * (H // 8), 256, 0,
                               [P(st.g_m), P(w["wd"]), P(st.g_x),
                                I32(I), I32(H), I32(B)]))
-                rl.append(rk.rtc.build_node_graph(nodes))
+                st.g_spec.append(list(nodes))
                 self._gstep_ec = min(6, 3 + (i >> 4))
             # tail: final rms -> g_h; logits gemv; argmax+pos
             tail = [
@@ -618,12 +616,20 @@ class Engine:
                  [P(st.g_logits), P(st.cur), P(st.pos),
                   I32(V), I32(B)]),
             ]
-            rl.append(rk.rtc.build_node_graph(tail))
-            self._gstep_nodes = len(rl)
-            self._gstep_ec = 7
+            st.g_spec.append(list(tail))
         for rp in st.g_rl:
             rp()
         self._gstep_ec = 8
+        self._last_logits = st.g_logits
+
+    def _decode_step_gdirect(self, st: _State) -> None:
+        """Same kernel plan as gstep but via plain cuLaunchKernel calls —
+        no graph machinery at all."""
+        if getattr(st, "g_spec", None) is None:
+            self._gstep_build(st)        # buffers + spec only, no graphs
+        for spec in st.g_spec:
+            for (fn, grid, block, smem, args) in spec:
+                self._rtk.rtc.launch(fn, grid, block, smem, args)
         self._last_logits = st.g_logits
 
     def _decode_step_rtc(self, st: _State) -> None:
@@ -1372,6 +1378,8 @@ class Engine:
         candidates.append(("eager_lean",
                            lambda s=st: self._decode_step_lean(s, True)))
         if self._rtk and getattr(self._rtk, "gf", None):
+            candidates.append(("gdirect",
+                               lambda s=st: self._decode_step_gdirect(s)))
             candidates.append(("gstep",
                                lambda s=st: self._decode_step_gstep(s)))
         if self._probe("graph"):
@@ -1537,6 +1545,7 @@ class Engine:
                         "eager_sdpa": 5, "eager_rtc": 3, "eager_rtc2": 4,
                         "mega_all": 8, "eager_leanr": 9, "eager_lean": 10,
                         "graph_lean": 11, "gstep": 15,
+                        "gdirect": 14,
                     }[name]
                     if name == "mega_all":
                         self._mega_adopted = 1

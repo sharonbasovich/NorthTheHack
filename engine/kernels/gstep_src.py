@@ -5,8 +5,24 @@
 # (8 bf16 lanes), warp-per-output-row.
 
 GSTEP_SRC = r"""
-#include <cuda_bf16.h>
-typedef __nv_bfloat16 bf16;
+
+typedef unsigned short bf16;
+__device__ __forceinline__ float bf2f(bf16 b) {
+    return __uint_as_float(((unsigned)b) << 16);
+}
+__device__ __forceinline__ bf16 f2bf(float f) {
+    unsigned u = __float_as_uint(f);
+    u += 0x7FFFu + ((u >> 16) & 1u);   // round-to-nearest-even
+    return (bf16)(u >> 16);
+}
+__device__ __forceinline__ bf16 bfmul(bf16 a, bf16 b) {
+    return f2bf(bf2f(a) * bf2f(b));
+}
+__device__ __forceinline__ bf16 bfadd(bf16 a, bf16 b) {
+    return f2bf(bf2f(a) + bf2f(b));
+}
+__device__ __forceinline__ bf16 bfneg(bf16 a) { return a ^ 0x8000u; }
+
 #define NT 256
 
 // x[b][i] = emb[cur[b]][i]
@@ -29,7 +45,7 @@ extern "C" __global__ void rms_k(const bf16* __restrict__ x,
     __shared__ float red[NT / 32];
     float acc = 0.f;
     for (int i = threadIdx.x; i < H; i += NT) {
-        float v = __bfloat162float(xr[i]); acc += v * v;
+        float v = bf2f(xr[i]); acc += v * v;
     }
     for (int off = 16; off; off >>= 1)
         acc += __shfl_down_sync(0xffffffffu, acc, off);
@@ -44,8 +60,7 @@ extern "C" __global__ void rms_k(const bf16* __restrict__ x,
     __syncthreads();
     float inv = rsqrtf(red[0] / (float)H + eps);
     for (int i = threadIdx.x; i < H; i += NT)
-        orr[i] = __float2bfloat16(__bfloat162float(xr[i]) * inv
-                                  * __bfloat162float(w[i]));
+        orr[i] = bfmul(w[i], f2bf(bf2f(xr[i]) * inv));
 }
 
 // out[b][row] = sum_i x[b][i] * W[row][i];  W [K,N] row-major, N%8==0.
@@ -68,11 +83,11 @@ extern "C" __global__ void gemv_k(const bf16* __restrict__ x,
         const bf16* wb = (const bf16*)&wv;
         #pragma unroll
         for (int j = 0; j < 8; ++j)
-            acc += __bfloat162float(ab[j]) * __bfloat162float(wb[j]);
+            acc += bf2f(ab[j]) * bf2f(wb[j]);
     }
     for (int off = 16; off; off >>= 1)
         acc += __shfl_down_sync(0xffffffffu, acc, off);
-    if (lane == 0) out[(long long)b * K + row] = __float2bfloat16(acc);
+    if (lane == 0) out[(long long)b * K + row] = f2bf(acc);
 }
 
 // out[b][row] += sum_i x[b][i] * W[row][i]  (residual epilogue)
@@ -94,13 +109,13 @@ extern "C" __global__ void gemv_add_k(const bf16* __restrict__ x,
         const bf16* wb = (const bf16*)&wv;
         #pragma unroll
         for (int j = 0; j < 8; ++j)
-            acc += __bfloat162float(ab[j]) * __bfloat162float(wb[j]);
+            acc += bf2f(ab[j]) * bf2f(wb[j]);
     }
     for (int off = 16; off; off >>= 1)
         acc += __shfl_down_sync(0xffffffffu, acc, off);
     if (lane == 0)
-        out[(long long)b * K + row] = __float2bfloat16(
-            __bfloat162float(out[(long long)b * K + row]) + acc);
+        out[(long long)b * K + row] = f2bf(
+            bf2f(out[(long long)b * K + row]) + acc);
 }
 
 // out[b][r] = silu(dot(x[b], W[r])) * dot(x[b], W[r+I]);  W [2I,N].
@@ -125,9 +140,9 @@ extern "C" __global__ void gemv_silu_k(const bf16* __restrict__ x,
         const bf16* p2 = (const bf16*)&v2;
         #pragma unroll
         for (int j = 0; j < 8; ++j) {
-            float xi = __bfloat162float(ab[j]);
-            a1 += xi * __bfloat162float(p1[j]);
-            a2 += xi * __bfloat162float(p2[j]);
+            float xi = bf2f(ab[j]);
+            a1 += xi * bf2f(p1[j]);
+            a2 += xi * bf2f(p2[j]);
         }
     }
     for (int off = 16; off; off >>= 1) {
@@ -135,8 +150,11 @@ extern "C" __global__ void gemv_silu_k(const bf16* __restrict__ x,
         a2 += __shfl_down_sync(0xffffffffu, a2, off);
     }
     if (lane == 0) {
-        float s = a1 / (1.f + expf(-a1));
-        out[(long long)b * I + row] = __float2bfloat16(s * a2);
+        bf16 g1 = f2bf(a1);                    // as gu would store
+        bf16 g2 = f2bf(a2);
+        float gf = bf2f(g1);
+        bf16 s1 = f2bf(gf / (1.f + expf(-gf)));  // silu in fp32->bf16
+        out[(long long)b * I + row] = bfmul(s1, g2);
     }
 }
 
@@ -158,28 +176,21 @@ extern "C" __global__ void rope_kv_k(bf16* __restrict__ qkv,
     bf16* src = qkv + ((long long)b * (NQ + 2 * NKV) + h) * D;
     const bf16* nw = (h < NQ) ? qn : kn;
     __shared__ float red[4];
-    float v = __bfloat162float(src[d]);
+    float v = bf2f(src[d]);
     float acc = v * v;
     for (int off = 16; off; off >>= 1)
         acc += __shfl_down_sync(0xffffffffu, acc, off);
     if ((d & 31) == 0) red[d >> 5] = acc;
     __syncthreads();
-    if (d == 0) {
-        float s = red[0] + red[1] + red[2] + red[3];
-        red[0] = rsqrtf(s / (float)D + eps);
-    }
+    float tot = red[0] + red[1] + red[2] + red[3];
+    __shared__ bf16 srope[128];
+    float inv = rsqrtf(tot / (float)D + eps);
+    srope[d] = bfmul(nw[d], f2bf(v * inv));
     __syncthreads();
-    float inv = red[0];
-    float xn = v * inv * __bfloat162float(nw[d]);
-    int half = D >> 1;
-    bf16* other = (d < half) ? src + half + d : src - half + d;
-    float vo = __bfloat162float(other[0]);
-    float xo = vo * inv * __bfloat162float(
-        nw[(d < half) ? d + half : d - half]);
-    float cs = __bfloat162float(cost[p * D + d]);
-    float sn = __bfloat162float(sint[p * D + d]);
-    float r = (d < half) ? (xn * cs - xo * sn) : (xn * cs + xo * sn);
-    bf16 val = __float2bfloat16(r);
+    bf16 me = srope[d];
+    bf16 rot = (d < 64) ? bfneg(srope[d + 64]) : srope[d - 64];
+    bf16 val = bfadd(bfmul(me, cost[p * D + d]),
+                     bfmul(rot, sint[p * D + d]));
     if (h < NQ) {
         qe[((long long)b * NQ + h) * D + d] = val;
     } else {
@@ -209,13 +220,13 @@ extern "C" __global__ void attn_k(const bf16* __restrict__ qe,
     const bf16* vbase = vc + (((long long)b * NKV + kv) * S) * D;
     float qf[4];
     for (int i = 0; i < 4; ++i)
-        qf[i] = __bfloat162float(q[lane + i * 32]);
+        qf[i] = bf2f(q[lane + i * 32]);
     float mx = -1e30f;
     for (int s = lane; s < L; s += 32) {
         const bf16* k = kbase + (long long)s * D;
         float acc = 0.f;
         for (int i = 0; i < 4; ++i)
-            acc += qf[i] * __bfloat162float(k[lane + i * 32]);
+            acc += qf[i] * bf2f(k[lane + i * 32]);
         for (int off = 16; off; off >>= 1)
             acc += __shfl_xor_sync(0xffffffffu, acc, off);
         if (acc * scale > mx) mx = acc * scale;
@@ -227,14 +238,14 @@ extern "C" __global__ void attn_k(const bf16* __restrict__ qe,
         const bf16* k = kbase + (long long)s * D;
         float acc = 0.f;
         for (int i = 0; i < 4; ++i)
-            acc += qf[i] * __bfloat162float(k[lane + i * 32]);
+            acc += qf[i] * bf2f(k[lane + i * 32]);
         for (int off = 16; off; off >>= 1)
             acc += __shfl_xor_sync(0xffffffffu, acc, off);
         float e = expf(acc * scale - mx);
         den += e;
         const bf16* vv = vbase + (long long)s * D;
         for (int i = 0; i < 4; ++i)
-            oacc[i] += e * __bfloat162float(vv[lane + i * 32]);
+            oacc[i] += e * bf2f(vv[lane + i * 32]);
     }
     for (int off = 16; off; off >>= 1)
         den += __shfl_xor_sync(0xffffffffu, den, off);
@@ -242,7 +253,7 @@ extern "C" __global__ void attn_k(const bf16* __restrict__ qe,
     bf16* orow = out + (((long long)b * NKV * GROUP) + kv * GROUP
                         + warp) * D;
     for (int i = 0; i < 4; ++i)
-        orow[lane + i * 32] = __float2bfloat16(oacc[i] * inv);
+        orow[lane + i * 32] = f2bf(oacc[i] * inv);
 }
 
 // cur[b] = argmax(logits[b]); pos[b] += 1. logits bf16 [B,V].
@@ -255,7 +266,7 @@ extern "C" __global__ void argmax_pos_k(const bf16* __restrict__ logits,
     __shared__ int si[NT / 32];
     float bv = -1e30f; int bi = -1;
     for (int i = threadIdx.x; i < V; i += NT) {
-        float v = __bfloat162float(r[i]);
+        float v = bf2f(r[i]);
         if (v > bv) { bv = v; bi = i; }
     }
     for (int off = 16; off; off >>= 1) {
