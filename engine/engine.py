@@ -1167,7 +1167,7 @@ class Engine:
         if self._rtk:
             # mega first: it is the best path when it works and must never
             # be starved by a slow graph-capture attempt ahead of it
-            if st.B <= getattr(self._rtk, "nblk", 0):
+            if False and st.B <= getattr(self._rtk, "nblk", 0):
                 candidates.append(("mega_all",
                                    lambda s=st: self._decode_all(s)))
             if getattr(self._rtk, "rms", None) is not None:
