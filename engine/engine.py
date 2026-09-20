@@ -472,23 +472,32 @@ class Engine:
     def _decode_step_lean(self, st: _State, rms_fast: bool = True) -> None:
         """_decode_step_slow with the rope chain collapsed to one matmul
         and (optionally) F.rms_norm — fewer kernel launches per layer.
-        Margin-gated identically to every other candidate."""
+        The q/k norm weights are per-head [40,128], so the fast path uses
+        two F.rms_norm calls (weights qn/kn, [128] each) fused straight
+        into the rope matmul. Margin-gated like every candidate."""
         B = st.B
-        rms = (_rms if not rms_fast
-               else (lambda x, w: F.rms_norm(x, (x.shape[-1],), w, EPS)))
         x = F.embedding(st.cur, self.embed_w)
         Mb = self._rope_matrix(st).index_select(0, st.pos).unsqueeze(1)
         nvalid = st.srange[None, :] > st.pos[:, None]
         _fl = st.kw1 + st.pos.view(B, 1).expand(B, NKV).reshape(-1)
         for i, w in enumerate(self.layers):
-            h = rms(x.view(B, H), w["ln_in"]).view(B, H)
+            if rms_fast:
+                h = F.rms_norm(x.view(B, H), (H,), w["ln_in"], EPS)
+            else:
+                h = _rms(x, w["ln_in"]).view(B, H)
             qkv = h @ w["wqkv"].t()
             qk = qkv[:, : (NQ + NKV) * D].view(B, 1, NQ + NKV, D)
             v = qkv[:, NQ * D + NKV * D :].view(B, 1, NKV, D)
-            qkn = rms(qk, w["qkn"])
-            qke = torch.matmul(qkn, Mb)
-            qe = qke[:, :, :NQ]
-            ke = qke[:, :, NQ:]
+            if rms_fast:
+                qe = torch.matmul(
+                    F.rms_norm(qk[:, :, :NQ], (D,), w["qn"], EPS), Mb)
+                ke = torch.matmul(
+                    F.rms_norm(qk[:, :, NQ:], (D,), w["kn"], EPS), Mb)
+            else:
+                qkn = _rms(qk, w["qkn"])
+                qke = torch.matmul(qkn, Mb)
+                qe = qke[:, :, :NQ]
+                ke = qke[:, :, NQ:]
             st.kc[i].view(-1, D).index_copy_(0, _fl, ke.reshape(-1, D))
             st.vc[i].view(-1, D).index_copy_(0, _fl, v.reshape(-1, D))
             qg = qe.reshape(B, NKV, GROUP, D)
@@ -498,11 +507,17 @@ class Engine:
             o = torch.matmul(p, st.vc[i]).view(B, NQ * D)
             xf = x.view(B, H)
             x = torch.addmm(xf, o, w["wo"].t()).view(B, 1, H)
-            h2 = rms(x.view(B, H), w["ln_post"]).view(B, H)
+            if rms_fast:
+                h2 = F.rms_norm(x.view(B, H), (H,), w["ln_post"], EPS)
+            else:
+                h2 = _rms(x, w["ln_post"]).view(B, H)
             gu = h2 @ w["wgu"].t()
             m = F.silu(gu[:, :I]) * gu[:, I:]
             x = torch.addmm(x.view(B, H), m, w["wd"].t()).view(B, 1, H)
-        x = _rms(x, self.fin_w)
+        if rms_fast:
+            x = F.rms_norm(x.view(B, H), (H,), self.fin_w, EPS).view(B, 1, H)
+        else:
+            x = _rms(x, self.fin_w)
         logits = x.view(B, H) @ self.lm_w.t()
         self._last_logits = logits
         tok = logits.argmax(dim=-1)
