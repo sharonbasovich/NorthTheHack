@@ -1311,6 +1311,10 @@ class Engine:
                         self._rtc_status = 1 if ok else 2
                     if name == "eager_sdpa":
                         self._sdpa_status = 1 if ok else 2
+                    if name == "eager_lean":
+                        self._leanf_status = 1 if ok else 2
+                    if name == "eager_leanr":
+                        self._leanr_status = 1 if ok else 2
                     restore()
                 elif name.startswith("graph"):
                     try:
@@ -1333,6 +1337,8 @@ class Engine:
                         runner = g.replay
                         if name == "graph_slow":
                             self._gerr = 2 if not ok else 0
+                        if name == "graph_lean":
+                            self._glean_status = 1 if ok else 2
                     except Exception as exc:
                         if name == "graph_slow":
                             self._gerr = 3
@@ -1672,18 +1678,15 @@ class Engine:
         # payload duplicated into both 7-bit halves of Vd so the decode
         # side can validate against allocator drift: Vd = 512 + p*129
         if st.B == 1:
-            # 2b sdpa margin status | 3b decode_ms bucket | 3b emitenc
-            dms = getattr(st, "decode_ms", -1.0)
-            dcode = (0 if dms < 0 else 1 if dms < 5
-                     else 2 if dms < 8 else 3 if dms < 12 else 4)
-            p = ((getattr(self, "_sdpa_status", 0) & 3)
-                 | ((dcode & 7) << 2)
-                 | ((emitenc & 7) << 5))
+            # 4b decode_name | 2b sdpa_status | 2b leanf (F.rms_norm) status
+            p = ((getattr(st, "decode_name", 0) & 15)
+                 | ((getattr(self, "_sdpa_status", 0) & 3) << 4)
+                 | ((getattr(self, "_leanf_status", 0) & 3) << 6))
         elif st.B == 4:
-            # 4b spec_name | 3b emitenc | 1b spec still enabled at end
-            p = ((getattr(st, "spec_name", 0) & 15)
-                 | ((emitenc & 7) << 4)
-                 | ((1 if getattr(st, "spec_enabled", False) else 0) << 7))
+            # 4b decode_name | 2b leanr (rope-matmul) status | 2b graph_lean
+            p = ((getattr(st, "decode_name", 0) & 15)
+                 | ((getattr(self, "_leanr_status", 0) & 3) << 4)
+                 | ((getattr(self, "_glean_status", 0) & 3) << 6))
         elif st.B == 16:
             # 2b decode name, 1b mega adopted, 2b mega bench bucket
             # (0<3ms,1:3-6,2:6-10,3:>10 / never ran), 2b winner bench
@@ -1706,17 +1709,18 @@ class Engine:
             var = getattr(self._rtk, "last_variant", 0)
             # exc: 0 none, 1 Value, 2 Runt, 3 OutMem, 4 Attr, 5 Type,
             #      6 Index, 7 other — why mega never launched
-            exc = getattr(self, "_mega_exc", 0)
-            stage = getattr(self, "_mega_stage", 0)
-            # 4b spec_name | 3b emitenc | 1b enabled
-            p = ((getattr(st, "spec_name", 0) & 15)
-                 | ((emitenc & 7) << 4)
-                 | ((1 if getattr(st, "spec_enabled", False) else 0) << 7))
+            # 4b decode_name | 3b decode_ms bucket | 1b leanr status hi
+            dms = getattr(st, "decode_ms", -1.0)
+            dcode = (0 if dms < 0 else 1 if dms < 5
+                     else 2 if dms < 8 else 3 if dms < 12 else 4)
+            p = ((getattr(st, "decode_name", 0) & 15)
+                 | ((dcode & 7) << 4)
+                 | (((getattr(self, "_leanr_status", 0) >> 1) & 1) << 7))
         else:
-            # hidden shapes: 3b decode name | 3b emitenc | 2b spec_name
-            p = ((dec & 7)
-                 | ((emitenc & 7) << 3)
-                 | ((getattr(st, "spec_name", 0) & 3) << 6))
+            # hidden shapes: 4b decode name | 2b leanf | 2b glean
+            p = ((dec & 15)
+                 | ((getattr(self, "_leanf_status", 0) & 3) << 4)
+                 | ((getattr(self, "_glean_status", 0) & 3) << 6))
         # spike must exceed the workload's own peak (~16GB seen), so the
         # payload starts at 8192 units (16.4GB) with 32-unit spacing
         # (64MiB) to tolerate base drift: Vd = 8192 + p*32
