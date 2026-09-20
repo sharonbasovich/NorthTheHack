@@ -1353,6 +1353,8 @@ class Engine:
         self._batch_err = 15   # 15 = threw inside the step call itself
         try:
             self._decode_step_slow_batch(st)
+            self._batch_err = 16   # survived the batch step itself
+            raise _SkipSpec()
             self._batch_err = 1
             ref_logits_b = self._last_logits_b.clone().view(st.B, R, V)
             self._batch_err = 2
