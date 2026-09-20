@@ -565,7 +565,8 @@ class Engine:
             st.m_pstream = torch.cuda.Stream()
             self._mega_stage = 4
         self._mega_stage = 5
-        st.m_cnt[st.B:].fill_(0)   # reset residency probe slot
+        st.m_cnt.fill_(0)          # reset barrier counts + probe slot
+        st.m_gen.fill_(0)          # reset barrier generations
         rk.step_all(st.m_lw, self.embed_w, self.fin_w, st.cos, st.sin,
                     st.pos, st.cur, st.m_hid, st.m_hbuf, st.m_qkv,
                     st.m_obuf, st.m_gu, st.m_logits, st.m_amaxv,

@@ -398,7 +398,13 @@ __device__ __forceinline__ void gbar_sw(unsigned* cnt, volatile unsigned* gen,
             __threadfence();
             atomicExch((unsigned*)gen, g + 1);
         } else {
-            while (*gen == g) { }
+            long long sp = 0;
+            while (*gen == g) {
+                // timeout: poison gen so every peer's spin exits and the
+                // kernel drains to completion (wrong results → host
+                // margin check rejects the candidate — no hang)
+                if (++sp > 200000000LL) { *gen = 0xdeadffffu; break; }
+            }
         }
     }
     __syncthreads();
