@@ -1459,7 +1459,7 @@ class Engine:
         if self._rtk:
             # mega first: it is the best path when it works and must never
             # be starved by a slow graph-capture attempt ahead of it
-            if getattr(self._rtk, "megafn", None) is not None:
+            if False:   # mega racy under gVisor — incorrect_output flake
                 candidates.append(("mega_all",
                                    lambda s=st: self._decode_all(s)))
             if getattr(self._rtk, "rms", None) is not None:
