@@ -1358,34 +1358,8 @@ class Engine:
                                    lambda s=st: self._decode_step_rtc2(s)))
                 candidates.append(("eager_rtc",
                                    lambda s=st: self._decode_step_rtc(s)))
-        # try the graph capture even when the probe failed — probes have
-        # been flaky under gVisor and a real capture attempt fails fast.
-        candidates.append(("graph_slow", self._decode_step_slow))
-        if _HAS_TRITON and not self._step_slow_only:
-            candidates.append(("graph_fast", self._decode_step_fast))
-        candidates.append(("eager_sdpa",
-                           lambda s=st: self._decode_step_sdpa(s)))
-        # lean steps: rope via one matmul per layer; _leanr keeps the
-        # manual _rms to isolate whether F.rms_norm is margin-safe
-        candidates.append(("eager_leanr",
-                           lambda s=st: self._decode_step_lean(s, False)))
         candidates.append(("eager_lean",
                            lambda s=st: self._decode_step_lean(s, True)))
-        if self._rtk and getattr(self._rtk, "gf", None):
-            candidates.append(("gstep",
-                               lambda s=st: self._decode_step_gstep(s)))
-        if self._probe("graph"):
-            candidates.append(("graph_lean", self._decode_step_lean))
-        if self._probe("toolchain"):
-            candidates.append(("ext", "ext"))
-        if _HAS_TRITON and not self._step_slow_only:
-            candidates.append(("eager_fast", lambda s=st: self._decode_step_fast(s)))
-        if _HAS_TRITON:
-            candidates.append(("eager_rms", lambda s=st: self._decode_step_rms(s)))
-        # jit only as a fallback: tracing ~1300 ops costs ~10-60s per call,
-        # so skip it entirely when the C++ ext loaded (it strictly dominates).
-        if self._ext is None and self._probe("jit"):
-            candidates.append(("jit", "jit"))
         self._gn = 9  # BISECT: skip graph-node probe entirely
         if False:
             # flaky-under-gvisor: cache verdict across workload processes
