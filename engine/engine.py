@@ -1308,6 +1308,13 @@ class Engine:
                 else:
                     self._dbg("cand %s margin_fail" % name)
             except Exception as e:
+                if name == "mega_all":
+                    en = type(e).__name__
+                    self._mega_exc = (
+                        1 if "Value" in en else 2 if "Runtime" in en
+                        else 3 if "memory" in en.lower()
+                        else 4 if "Attr" in en else 5 if "Type" in en
+                        else 6 if "Index" in en else 7)
                 self._dbg("cand %s err %s" % (name, repr(e)[:160]))
                 restore()
 
@@ -1569,12 +1576,14 @@ class Engine:
             p = ((getattr(self, "_cand_tried", 0) & 15)
                  | ((getattr(self, "_cand_mask", 0) & 7) << 4))
         elif st.B == 4:
-            # bits: 0-2 rtc_status, 3 mega_flag ok, 4 mega adopted,
-            # 5-6 decode name low bits
-            p = ((getattr(self, "_rtc_status", 0) & 7)
+            # bits: 0-2 mega exc class, 3 mega_flag, 4 adopted,
+            # 5-6 variant, 7-9 rtc_status
+            var4 = getattr(self._rtk, "last_variant", 0)
+            p = ((getattr(self, "_mega_exc", 0) & 7)
                  | ((getattr(st, "mega_flag", False) & 1) << 3)
                  | ((getattr(self, "_mega_adopted", 0) & 1) << 4)
-                 | ((dec & 3) << 5))
+                 | ((var4 & 3) << 5)
+                 | ((getattr(self, "_rtc_status", 0) & 7) << 7))
         elif st.B == 16:
             # 2b decode name, 1b mega adopted, 2b mega bench bucket
             # (0<3ms,1:3-6,2:6-10,3:>10 / never ran), 2b winner bench
@@ -1595,16 +1604,19 @@ class Engine:
             ccode = (0 if cms < 3 else 1 if cms < 6 else 2 if cms < 10
                      else 3)
             var = getattr(self._rtk, "last_variant", 0)
+            # exc: 0 none, 1 Value, 2 Runt, 3 OutMem, 4 Attr, 5 Type,
+            #      6 Index, 7 other — why mega never launched
+            exc = getattr(self, "_mega_exc", 0)
             # variant: 0 none, 1 cluster, 2 coop, 3 software
-            p = ((dec & 3)
-                 | ((getattr(self, "_mega_adopted", 0) & 1) << 2)
-                 | ((var & 3) << 3) | (bcode << 5))
+            p = ((exc & 7)
+                 | ((getattr(self, "_mega_adopted", 0) & 1) << 3)
+                 | ((var & 3) << 4) | (bcode << 6))
         else:
             p = (dec & 7) | (emitenc << 3)
         # spike must exceed the workload's own peak (~16GB seen), so the
-        # payload starts at 8192 units (16.4GB) with 64-unit spacing to
-        # tolerate base drift: Vd = 8192 + p*64
-        return 8192 + min(p, 127) * 64
+        # payload starts at 8192 units (16.4GB) with 32-unit spacing
+        # (64MiB) to tolerate base drift: Vd = 8192 + p*32
+        return 8192 + min(p, 1023) * 32
 
     # ------------------------------------------------------------------
     # Partial-fused variants: Triton rmsnorm/silu_mul only, torch attention
