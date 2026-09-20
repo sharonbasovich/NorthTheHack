@@ -256,6 +256,169 @@ extern "C" __global__ void attn_k(const bf16* __restrict__ qe,
         orow[lane + i * 32] = f2bf(oacc[i] * inv);
 }
 
+
+
+// ---------------- verify (R rows per sequence) ----------------
+// x[b*R+t] = emb[inp[b,t]] — inp is int64 [B*R] flattened
+extern "C" __global__ void embed_r_k(const bf16* __restrict__ emb,
+        const long long* __restrict__ inp, bf16* __restrict__ x,
+        int H, int BR) {
+    int idx = blockIdx.x * NT + threadIdx.x;
+    int r = idx / H;
+    if (r >= BR) return;
+    x[idx] = emb[inp[r] * (long long)H + (idx - r * H)];
+}
+
+// rope+kv write for R rows: grid B*R*(NQ+NKV); row t works at pos[b]+t.
+// Also writes vc from the row's v-head slice.
+extern "C" __global__ void rope_kv_r_k(const bf16* __restrict__ qkv,
+        const bf16* __restrict__ qn, const bf16* __restrict__ kn,
+        const bf16* __restrict__ cost, const bf16* __restrict__ sint,
+        const long long* __restrict__ pos,
+        bf16* __restrict__ qe, bf16* __restrict__ kc,
+        bf16* __restrict__ vc, int S, int NQ, int NKV, int D,
+        int R, float eps) {
+    int nh = NQ + NKV;
+    int brh = blockIdx.x;
+    int h = brh % nh;
+    int br = brh / nh;          // b*R + t
+    int b = br / R;
+    int t = br - b * R;
+    int d = threadIdx.x;
+    long long p = pos[b] + t;
+    if (d >= D) return;
+    const bf16* src = qkv + ((long long)br * (NQ + 2 * NKV) + h) * D;
+    const bf16* nw = (h < NQ) ? qn : kn;
+    __shared__ float red[4];
+    float v = bf2f(src[d]);
+    float acc = v * v;
+    for (int off = 16; off; off >>= 1)
+        acc += __shfl_down_sync(0xffffffffu, acc, off);
+    if ((d & 31) == 0) red[d >> 5] = acc;
+    __syncthreads();
+    float tot = red[0] + red[1] + red[2] + red[3];
+    __shared__ bf16 srope[128];
+    float inv = rsqrtf(tot / (float)D + eps);
+    srope[d] = bfmul(nw[d], f2bf(v * inv));
+    __syncthreads();
+    bf16 me = srope[d];
+    bf16 rot = (d < 64) ? bfneg(srope[d + 64]) : srope[d - 64];
+    bf16 val = bfadd(bfmul(me, cost[p * D + d]),
+                     bfmul(rot, sint[p * D + d]));
+    if (h < NQ) {
+        qe[((long long)br * NQ + h) * D + d] = val;
+    } else {
+        int kv = h - NQ;
+        kc[(((long long)b * NKV + kv) * S + p) * D + d] = val;
+        vc[(((long long)b * NKV + kv) * S + p) * D + d] =
+            qkv[((long long)br * (NQ + 2 * NKV) + NQ + NKV + kv) * D + d];
+    }
+}
+
+// verify attention: grid B*R*NKV; row t attends s <= pos[b]+t
+extern "C" __global__ void attn_r_k(const bf16* __restrict__ qe,
+        const bf16* __restrict__ kc, const bf16* __restrict__ vc,
+        const long long* __restrict__ pos,
+        bf16* __restrict__ out,
+        int S, int NKV, int GROUP, int D, int BR, int R,
+        float scale) {
+    int br = blockIdx.x / NKV;
+    int kv = blockIdx.x - br * NKV;
+    int b = br / R;
+    int t = br - b * R;
+    int L = (int)(pos[b] + t) + 1;
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    if (warp >= GROUP) return;
+    const bf16* q = qe + (((long long)br * NKV * GROUP) + kv * GROUP
+                        + warp) * D;
+    const bf16* kbase = kc + (((long long)b * NKV + kv) * S) * D;
+    const bf16* vbase = vc + (((long long)b * NKV + kv) * S) * D;
+    float qf[4];
+    for (int i = 0; i < 4; ++i)
+        qf[i] = bf2f(q[lane + i * 32]);
+    float mx = -1e30f;
+    for (int s = lane; s < L; s += 32) {
+        const bf16* k = kbase + (long long)s * D;
+        float acc = 0.f;
+        for (int i = 0; i < 4; ++i)
+            acc += qf[i] * bf2f(k[lane + i * 32]);
+        for (int off = 16; off; off >>= 1)
+            acc += __shfl_xor_sync(0xffffffffu, acc, off);
+        if (acc * scale > mx) mx = acc * scale;
+    }
+    float den = 0.f;
+    float oacc[4];
+    for (int i = 0; i < 4; ++i) oacc[i] = 0.f;
+    for (int s = lane; s < L; s += 32) {
+        const bf16* k = kbase + (long long)s * D;
+        float acc = 0.f;
+        for (int i = 0; i < 4; ++i)
+            acc += qf[i] * bf2f(k[lane + i * 32]);
+        for (int off = 16; off; off >>= 1)
+            acc += __shfl_xor_sync(0xffffffffu, acc, off);
+        float e = expf(acc * scale - mx);
+        den += e;
+        const bf16* vv = vbase + (long long)s * D;
+        for (int i = 0; i < 4; ++i)
+            oacc[i] += e * bf2f(vv[lane + i * 32]);
+    }
+    for (int off = 16; off; off >>= 1)
+        den += __shfl_xor_sync(0xffffffffu, den, off);
+    float inv = 1.f / den;
+    bf16* orow = out + (((long long)br * NKV * GROUP) + kv * GROUP
+                        + warp) * D;
+    for (int i = 0; i < 4; ++i)
+        orow[lane + i * 32] = f2bf(oacc[i] * inv);
+}
+
+// per-row argmax: grid B*R -> emit[b*R+t] = argmax(logits[br])
+extern "C" __global__ void argmax_r_k(const bf16* __restrict__ logits,
+        long long* __restrict__ emit, int V, int R) {
+    int br = blockIdx.x;
+    const bf16* r = logits + (long long)br * V;
+    __shared__ float sv[NT / 32];
+    __shared__ int si[NT / 32];
+    float bv = -1e30f; int bi = -1;
+    for (int i = threadIdx.x; i < V; i += NT) {
+        float v = bf2f(r[i]);
+        if (v > bv) { bv = v; bi = i; }
+    }
+    for (int off = 16; off; off >>= 1) {
+        float ov = __shfl_down_sync(0xffffffffu, bv, off);
+        int oi = __shfl_down_sync(0xffffffffu, bi, off);
+        if (ov > bv) { bv = ov; bi = oi; }
+    }
+    if ((threadIdx.x & 31) == 0) { sv[threadIdx.x >> 5] = bv;
+                                   si[threadIdx.x >> 5] = bi; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        bv = sv[0]; bi = si[0];
+        for (int i = 1; i < NT / 32; ++i)
+            if (sv[i] > bv) { bv = sv[i]; bi = si[i]; }
+        emit[(br / R) * (R + 1) + (br - (br / R) * R)] = bi;
+    }
+}
+
+// finish: matched-prefix count + pos advance + cur update.
+// grid B. emit_dev[b] layout [R+1]: [am_0..am_{R-1}, m]
+extern "C" __global__ void emit_finish_k(long long* __restrict__ emit_dev,
+        const long long* __restrict__ inp,
+        long long* __restrict__ cur, long long* __restrict__ pos,
+        int R) {
+    int b = blockIdx.x;
+    if (threadIdx.x != 0) return;
+    long long* er = emit_dev + (long long)b * (R + 1);
+    const long long* ir = inp + (long long)b * R;
+    int m = 1;
+    for (int t = 0; t < R - 1; ++t) {
+        if (er[t] == ir[t + 1]) m++; else break;
+    }
+    er[R] = m;
+    cur[b] = er[m - 1];       // last accepted argmax becomes next input
+    pos[b] += m;
+}
+
 // cur[b] = argmax(logits[b]); pos[b] += 1. logits bf16 [B,V].
 extern "C" __global__ void argmax_pos_k(const bf16* __restrict__ logits,
         long long* __restrict__ cur, long long* __restrict__ pos,

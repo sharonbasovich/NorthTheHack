@@ -210,10 +210,9 @@ class _State:
         self.spec_runner = None      # verify pass runner (graph or eager)
         self.spec_ms = float("inf")
         self.spec_enabled = False
-        # speculative verify is a net loss at ~26us/kernel dispatch
-        # (measured 330 vs 478 baseline on v87) — leave off until the
-        # verify pass itself gets cheaper
-        self._spec_on = False
+        # speculative verify: gated at runtime by emit-vs-cost — ON now
+        # that the gverify custom-kernel pass makes R rows nearly free
+        self._spec_on = True
         self.pre_graph = None        # whole-prefill graph
         self.ids_dev = None          # [B, L] graph input for prefill replay
         self.first_dev = None        # [B] argmax output of captured prefill
@@ -649,6 +648,86 @@ class Engine:
             for (fn, grid, block, smem, args) in spec:
                 self._rtk.rtc.launch(fn, grid, block, smem, args)
         self._last_logits = st.g_logits
+
+    def _gverify_build(self, st) -> None:
+        """Spec-decode verify pass (R rows/seq) as a launch plan of the same
+        fused kernels — R rows treated as batch."""
+        if getattr(st, "gv_spec", None) is not None:
+            return
+        rk = self._rtk
+        B = st.B
+        dev = self.dev
+        bf = torch.bfloat16
+        BR = B * R
+        st.gv_x = torch.zeros(BR, H, dtype=bf, device=dev)
+        st.gv_h = torch.zeros(BR, H, dtype=bf, device=dev)
+        st.gv_qkv = torch.zeros(BR, 48 * D, dtype=bf, device=dev)
+        st.gv_qe = torch.zeros(BR, NQ * D, dtype=bf, device=dev)
+        st.gv_o = torch.zeros(BR, NQ * D, dtype=bf, device=dev)
+        st.gv_m = torch.zeros(BR, I, dtype=bf, device=dev)
+        st.gv_logits = torch.zeros(BR, V, dtype=bf, device=dev)
+        import ctypes
+        def P(t): return ctypes.c_void_p(t.data_ptr())
+        def I32(v): return ctypes.c_int(int(v))
+        def F32(v): return ctypes.c_float(float(v))
+        gf = rk.gf
+        spec = []
+        spec.append([(gf["embed_r_k"], (BR * H + 255) // 256, 256, 0,
+                      [P(self.embed_w), P(st.inp), P(st.gv_x),
+                       I32(H), I32(BR)])])
+        for i, w in enumerate(self.layers):
+            nodes = []
+            nodes.append((gf["rms_k"], BR, 256, 0,
+                          [P(st.gv_x), P(w["ln_in"]), P(st.gv_h),
+                           I32(H), I32(BR), F32(EPS)]))
+            nodes.append((gf["gemv_k"], BR * (48 * D // 8), 256, 0,
+                          [P(st.gv_h), P(w["wqkv"]), P(st.gv_qkv),
+                           I32(H), I32(48 * D), I32(BR)]))
+            nodes.append((gf["rope_kv_r_k"], BR * (NQ + NKV), 128, 0,
+                          [P(st.gv_qkv), P(w["qn"]), P(w["kn"]),
+                           P(st.cos), P(st.sin), P(st.pos),
+                           P(st.gv_qe), P(st.kc[i]), P(st.vc[i]),
+                           I32(st.S), I32(NQ), I32(NKV), I32(D),
+                           I32(R), F32(EPS)]))
+            nodes.append((gf["attn_r_k"], BR * NKV, 128, 0,
+                          [P(st.gv_qe), P(st.kc[i]), P(st.vc[i]),
+                           P(st.pos), P(st.gv_o),
+                           I32(st.S), I32(NKV), I32(GROUP), I32(D),
+                           I32(BR), I32(R), F32(SCALE)]))
+            nodes.append((gf["gemv_add_k"], BR * (H // 8), 256, 0,
+                          [P(st.gv_o), P(w["wo"]), P(st.gv_x),
+                           I32(NQ * D), I32(H), I32(BR)]))
+            nodes.append((gf["rms_k"], BR, 256, 0,
+                          [P(st.gv_x), P(w["ln_post"]), P(st.gv_h),
+                           I32(H), I32(BR), F32(EPS)]))
+            nodes.append((gf["gemv_silu_k"], BR * (I // 8), 256, 0,
+                          [P(st.gv_h), P(w["wgu"]), P(st.gv_m),
+                           I32(H), I32(I), I32(BR)]))
+            nodes.append((gf["gemv_add_k"], BR * (H // 8), 256, 0,
+                          [P(st.gv_m), P(w["wd"]), P(st.gv_x),
+                           I32(I), I32(H), I32(BR)]))
+            spec.append(nodes)
+        spec.append([
+            (gf["rms_k"], BR, 256, 0,
+             [P(st.gv_x), P(self.fin_w), P(st.gv_h),
+              I32(H), I32(BR), F32(EPS)]),
+            (gf["gemv_k"], BR * (V // 8), 256, 0,
+             [P(st.gv_h), P(self.lm_w), P(st.gv_logits),
+              I32(H), I32(V), I32(BR)]),
+            (gf["argmax_r_k"], BR, 256, 0,
+             [P(st.gv_logits), P(st.emit_dev), I32(V), I32(R)]),
+            (gf["emit_finish_k"], B, 32, 0,
+             [P(st.emit_dev), P(st.inp), P(st.cur), P(st.pos),
+              I32(R)]),
+        ])
+        st.gv_spec = spec
+
+    def _decode_step_gverify(self, st: _State) -> None:
+        self._gverify_build(st)
+        for spec in st.gv_spec:
+            for (fn, grid, block, smem, args) in spec:
+                self._rtk.rtc.launch(fn, grid, block, smem, args)
+        self._last_logits_b = st.gv_logits
 
     def _decode_step_rtc(self, st: _State) -> None:
         """Decode step on NVRTC-compiled fused kernels: ~9 CUDA launches
@@ -1689,11 +1768,17 @@ class Engine:
             self._batch_exc = type(exc).__name__[:10]
             restore()
         if ref_logits_b is not None:
-            for make in ("ext", "jit", "graphb", "graph", "eager", "rms"):
+            for make in ("gver", "ext", "jit", "graphb", "graph", "eager",
+                          "rms"):
                 if over_budget():
                     break
                 try:
-                    if make == "rms":
+                    if make == "gver":
+                        if not (self._rtk and getattr(self._rtk, "gf", None)
+                                and "emit_finish_k" in self._rtk.gf):
+                            continue
+                        runner = lambda: self._decode_step_gverify(st)
+                    elif make == "rms":
                         if not _HAS_TRITON:
                             continue
                         runner = lambda: self._decode_step_batch_rms(st)
@@ -1748,7 +1833,7 @@ class Engine:
                             st.spec_runner = runner
                             st.spec_name = {
                                 "ext": 2, "jit": 3, "graph": 4, "eager": 5,
-                                "rms": 6, "graphb": 7,
+                                "rms": 6, "graphb": 7, "gver": 8,
                             }[make]
                         else:
                             self._dbg("spec %s margin_fail" % make)

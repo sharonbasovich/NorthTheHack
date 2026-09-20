@@ -1414,7 +1414,8 @@ class RtcKernels:
                 pass
             fn_names = ("embed_k", "rms_k", "gemv_k", "gemv_add_k",
                         "gemv_silu_k", "rope_kv_k", "attn_k",
-                        "argmax_pos_k")
+                        "argmax_pos_k", "embed_r_k", "rope_kv_r_k",
+                        "attn_r_k", "argmax_r_k", "emit_finish_k")
             for attempt in range(6):
                 blob = blobs[attempt % len(blobs)] if blobs else None
                 if blob is None:
@@ -1438,7 +1439,7 @@ class RtcKernels:
                     if ok and len(self.gf) == len(fn_names):
                         self.gf_err = 0
                         break
-                    self.gf_err = 28
+                    self.gf_err = 28 if ok else self.gf_err
         except Exception:
             self.gf = {}
             if not getattr(self, "gf_err", 0):
