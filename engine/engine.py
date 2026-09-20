@@ -213,7 +213,7 @@ class _State:
         # speculative verify is a net loss at ~26us/kernel dispatch
         # (measured 330 vs 478 baseline on v87) — leave off until the
         # verify pass itself gets cheaper
-        self._spec_on = False
+        self._spec_on = True
         self.pre_graph = None        # whole-prefill graph
         self.ids_dev = None          # [B, L] graph input for prefill replay
         self.first_dev = None        # [B] argmax output of captured prefill
@@ -1718,10 +1718,10 @@ class Engine:
                  | ((getattr(self, "_sdpa_exc", 0) & 3) << 4)
                  | ((getattr(self, "_leanf_exc", 0) & 7) << 6))
         elif st.B == 4:
-            # 4b decode_name | 2b leanr (rope-matmul) status | 2b graph_lean
+            # 4b decode_name | 3b emitenc | 1b spec enabled
             p = ((getattr(st, "decode_name", 0) & 15)
-                 | ((getattr(self, "_leanr_status", 0) & 3) << 4)
-                 | ((getattr(self, "_glean_status", 0) & 3) << 6))
+                 | ((emitenc & 7) << 4)
+                 | ((1 if getattr(st, "spec_enabled", False) else 0) << 7))
         elif st.B == 16:
             # 2b decode name, 1b mega adopted, 2b mega bench bucket
             # (0<3ms,1:3-6,2:6-10,3:>10 / never ran), 2b winner bench
@@ -1744,13 +1744,10 @@ class Engine:
             var = getattr(self._rtk, "last_variant", 0)
             # exc: 0 none, 1 Value, 2 Runt, 3 OutMem, 4 Attr, 5 Type,
             #      6 Index, 7 other — why mega never launched
-            # 4b decode_name | 3b decode_ms bucket | 1b leanr status hi
-            dms = getattr(st, "decode_ms", -1.0)
-            dcode = (0 if dms < 0 else 1 if dms < 5
-                     else 2 if dms < 8 else 3 if dms < 12 else 4)
+            # 4b decode_name | 3b emitenc | 1b spec enabled
             p = ((getattr(st, "decode_name", 0) & 15)
-                 | ((dcode & 7) << 4)
-                 | (((getattr(self, "_leanr_status", 0) >> 1) & 1) << 7))
+                 | ((emitenc & 7) << 4)
+                 | ((1 if getattr(st, "spec_enabled", False) else 0) << 7))
         else:
             # hidden shapes: 4b decode name | 2b leanf | 2b glean
             p = ((dec & 15)
