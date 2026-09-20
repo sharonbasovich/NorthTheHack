@@ -1222,20 +1222,40 @@ class RtcKernels:
                         [ptr(gu), ptr(out), i32(I)])
 
     def host_map(self, nbytes):
-        """Devicemapped host buffer -> (host ctypes array, device ptr)."""
-        hp = ctypes.c_void_p()
-        rc = self.rtc.cuda.cuMemHostAlloc(ctypes.byref(hp), nbytes, 0x03)
-        if rc or not hp:
-            raise RuntimeError(f"cuMemHostAlloc rc={rc}")
-        dp = ctypes.c_void_p()
-        rc = self.rtc.cuda.cuMemHostGetDevicePointer(
-            ctypes.byref(dp), hp, 0)
-        if rc or not dp:
-            raise RuntimeError(f"cuMemHostGetDevicePointer rc={rc}")
-        buf = (ctypes.c_longlong * (nbytes // 8)).from_address(hp.value)
-        for i in range(nbytes // 8):
-            buf[i] = 0
-        return buf, dp.value
+        """Zero-copy host buffer -> (host ctypes array, device ptr).
+
+        Under UVA a page-locked host allocation is directly addressable
+        by kernels — the host pointer IS the device pointer. Prefer
+        torch's pin_memory (works under gVisor where the raw driver
+        ioctl fails); fall back to cuMemHostAlloc variants.
+        """
+        try:
+            t = torch.zeros(nbytes // 8, dtype=torch.int64,
+                            pin_memory=True)
+            buf = (ctypes.c_longlong * (nbytes // 8)).from_address(
+                t.data_ptr())
+            self._pin_keepalive = getattr(self, "_pin_keepalive",
+                                          []) + [t]
+            return buf, t.data_ptr()
+        except Exception:
+            pass
+        for flag in (0x03, 0x01, 0x02, 0x00):
+            hp = ctypes.c_void_p()
+            rc = self.rtc.cuda.cuMemHostAlloc(
+                ctypes.byref(hp), nbytes, flag)
+            if rc or not hp:
+                continue
+            dp = ctypes.c_void_p()
+            rc = self.rtc.cuda.cuMemHostGetDevicePointer(
+                ctypes.byref(dp), hp, 0)
+            if rc or not dp:
+                continue
+            buf = (ctypes.c_longlong * (nbytes // 8)).from_address(
+                hp.value)
+            for i in range(nbytes // 8):
+                buf[i] = 0
+            return buf, dp.value
+        raise RuntimeError("host_map: all alloc paths failed")
 
     def step_all(self, lw, embed, finw, cost, sint, pos, cur, hid, hbuf,
                  qkv, obuf, gu, logits, amaxv, amaxi, cnt, gen,
