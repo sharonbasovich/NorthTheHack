@@ -1778,6 +1778,69 @@ class Engine:
                 self._cl = 1 if int(out2[0].item()) == 1234 else 3
             except Exception:
                 self._cl = 2
+            # stage 3: a 24-param kernel with the megakernel's launch
+            # shape — isolates whether instantiate failure is
+            # step_all-specific or general to big kernels.
+            self._d24 = 1
+            try:
+                from kernels.probecub import DUMMY24_PTX_B64
+                mod2 = ctypes.c_void_p()
+                rc = cu.cuModuleLoadData(ctypes.byref(mod2), ctypes.c_char_p(
+                    base64.b64decode(DUMMY24_PTX_B64)))
+                if rc or not mod2:
+                    raise RuntimeError("load2")
+                fn2 = ctypes.c_void_p()
+                rc = cu.cuModuleGetFunction(ctypes.byref(fn2), mod2,
+                                            b"dummy24_k")
+                if rc or not fn2:
+                    raise RuntimeError("fn2")
+                fl = torch.zeros(8, dtype=torch.int64,
+                                 device=st.cur.device)
+                _z64 = torch.zeros(16, dtype=torch.int64,
+                                   device=st.cur.device)
+                _zb = torch.zeros(256, dtype=torch.bfloat16,
+                                  device=st.cur.device)
+                _zf = torch.zeros(64, dtype=torch.float32,
+                                  device=st.cur.device)
+                _zi = torch.zeros(64, dtype=torch.int32,
+                                  device=st.cur.device)
+                _zu = torch.zeros(64, dtype=torch.uint32,
+                                  device=st.cur.device)
+                a24 = [ctypes.c_void_p(_z64.data_ptr()),
+                       ctypes.c_void_p(_zb.data_ptr()),
+                       ctypes.c_void_p(_zb.data_ptr()),
+                       ctypes.c_void_p(_zb.data_ptr()),
+                       ctypes.c_void_p(_zb.data_ptr()),
+                       ctypes.c_void_p(_z64.data_ptr()),
+                       ctypes.c_void_p(_z64.data_ptr()),
+                       ctypes.c_void_p(_zb.data_ptr()),
+                       ctypes.c_void_p(_zb.data_ptr()),
+                       ctypes.c_void_p(_zb.data_ptr()),
+                       ctypes.c_void_p(_zb.data_ptr()),
+                       ctypes.c_void_p(_zb.data_ptr()),
+                       ctypes.c_void_p(_zf.data_ptr()),
+                       ctypes.c_void_p(_zf.data_ptr()),
+                       ctypes.c_void_p(_zi.data_ptr()),
+                       ctypes.c_void_p(_zu.data_ptr()),
+                       ctypes.c_void_p(_zu.data_ptr()),
+                       ctypes.c_void_p(fl.data_ptr()),
+                       ctypes.c_void_p(fl.data_ptr()),
+                       ctypes.c_int(1), ctypes.c_int(36),
+                       ctypes.c_int(1), ctypes.c_float(1e-5),
+                       ctypes.c_longlong(64), ctypes.c_int(3)]
+                rep = getattr(getattr(self, "_rtk", None), "rtc", None)
+                if rep is None:
+                    raise RuntimeError("no rtc")
+                rp = rep.launch_node(fn2, 4, 1024, 1024, a24)
+                rp()
+                torch.cuda.synchronize()
+                self._d24 = 1 if int(fl[0].item()) == -777 else 5
+            except Exception as _e2:
+                self._d24 = {"cuGraphCreate": 2,
+                             "cuGraphAddKernelNode": 3,
+                             "cuGraphInstantiate": 4,
+                             "cuGraphLaunch": 5}.get(
+                                 str(_e2).split(" ")[0], 6)
             return 1
         except Exception:
             return 9
@@ -1825,9 +1888,9 @@ class Engine:
                  | ((getattr(self, "_gn", 0) & 7) << 4)
                  | ((getattr(self, "_leanf_exc", 0) & 3) << 7))
         elif st.B == 4:
-            # 4b decode_name | 3b capture-launch probe | 1b gn probe
+            # 4b decode_name | 3b dummy24-node probe | 1b gn probe
             p = ((getattr(st, "decode_name", 0) & 15)
-                 | ((getattr(self, "_cl", 0) & 7) << 4)
+                 | ((getattr(self, "_d24", 0) & 7) << 4)
                  | ((getattr(self, "_gn", 0) & 1) << 7))
         elif st.B == 16:
             # 2b decode name, 1b mega adopted, 2b mega bench bucket
@@ -1851,14 +1914,19 @@ class Engine:
             var = getattr(self._rtk, "last_variant", 0)
             # 4b decode_name | 3b mega-node probe | 1b gn probe
             mpf = getattr(self, "_mega_probe_flag", None)
-            gne = getattr(getattr(self._rtk, "rtc", None),
-                          "gn_err", (0, 0))[0]
-            mpc = (gne + 2 if gne else
-                   (0 if mpf is None else 1 if mpf == -333
-                    else 2))  # 3,4,5,6 = stage fail; 1 ok; 2 flag0
+            gne, gnrc = getattr(getattr(self._rtk, "rtc", None),
+                                "gn_err", (0, 0))
+            if gne:
+                mpc = min(15, gne)          # stage 1-4 in low nibble
+                mrc = min(15, gnrc)         # rc low nibble in high bits
+            else:
+                mpc = (0 if mpf is None else 1 if mpf == -333 else 2)
+                mrc = min(15, gnrc)
+            # 4b decode | 4b gn stage | 6b gn rc (14 bits max)
             p = ((getattr(st, "decode_name", 0) & 15)
-                 | ((mpc & 7) << 4)
-                 | ((getattr(self, "_gn", 0) & 1) << 7))
+                 | ((mpc & 15) << 4)
+                 | ((mrc & 15) << 8)
+                 | (((gnrc >> 4) & 3) << 12))
         else:
             # hidden shapes: 4b decode name | 2b leanf | 2b glean
             p = ((dec & 15)
